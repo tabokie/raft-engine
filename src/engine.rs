@@ -350,7 +350,7 @@ where
             global_stats.clone(),
         );
 
-        let engine = Engine {
+        let mut engine = Engine {
             cfg,
             memtables,
             pipe_log: pipe_log.clone(),

@@ -176,11 +176,11 @@ impl Task {
     }
 
     pub fn wait(&self) -> Result<(usize, u64, u64, Option<CacheTracker>)> {
-        let guard = self.mu.lock();
+        let mut guard = self.mu.lock();
         while guard.is_none() {
             self.cv.wait(&mut guard);
         }
-        (*guard).unwrap()
+        (*guard).take().unwrap()
     }
 }
 
@@ -206,7 +206,7 @@ impl PartialOrd for Task {
 }
 
 pub struct SortedTaskList {
-    inner: Mutex2<BinaryHeap<Task>>,
+    inner: Mutex2<BinaryHeap<Arc<Task>>>,
 }
 
 impl SortedTaskList {
@@ -215,13 +215,13 @@ impl SortedTaskList {
             inner: Mutex2::new(BinaryHeap::new()),
         }
     }
-    pub fn insert(&self, task: Task) {
-        let inner = self.inner.lock();
+    pub fn insert(&self, task: Arc<Task>) {
+        let mut inner = self.inner.lock();
         inner.push(task);
     }
 
-    pub fn pop(&self) -> Option<Task> {
-        let inner = self.inner.lock();
+    pub fn pop(&self) -> Option<Arc<Task>> {
+        let mut inner = self.inner.lock();
         inner.pop()
     }
 }
@@ -458,12 +458,13 @@ impl PipeLog {
     fn run_task(
         &self,
         submitor: &mut CacheSubmitor,
-        task: &mut Task,
+        task: &Task,
     ) -> Result<(usize, u64, u64, Option<CacheTracker>)> {
+        let mut sync = task.sync;
         let (file_num, offset, fd) =
-            self.append(LogQueue::Append, &task.content, &mut task.sync)?;
+            self.append(LogQueue::Append, &task.content, &mut sync)?;
         let tracker = submitor.get_cache_tracker(file_num, offset, task.entries_size);
-        if task.sync {
+        if sync {
             fd.sync()?;
         }
         Ok((task.content.len(), file_num, offset, tracker))
@@ -474,7 +475,8 @@ impl PipeLog {
         loop {
             let task = self.pending.pop();
             if let Some(task) = task {
-                task.set(self.run_task(&mut cache_submitor, &mut task));
+                let res = self.run_task(&mut cache_submitor, &task);
+                task.set(res);
             }
         }
     }
@@ -651,8 +653,8 @@ impl GenericPipeLog for PipeLog {
         start_time_hint: u64,
     ) -> Result<(usize, u64)> {
         if let Some(content) = batch.encode_to_bytes(self.compression_threshold) {
-            let task = Task::new(content, sync, batch.entries_size(), start_time_hint);
-            self.pending.insert(task);
+            let task = Arc::new(Task::new(content, sync, batch.entries_size(), start_time_hint));
+            self.pending.insert(task.clone());
             let (bytes, file_num, offset, tracker) = task.wait()?;
             for item in batch.items.iter_mut() {
                 if let LogItemContent::Entries(entries) = &mut item.content {
