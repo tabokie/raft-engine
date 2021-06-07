@@ -2,6 +2,7 @@ use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashSet};
 use std::io::BufRead;
 use std::sync::{Arc, Mutex, RwLock};
+use std::thread::{Builder as ThreadBuilder, JoinHandle};
 use std::time::{Duration, Instant};
 use std::{fmt, mem, u64};
 
@@ -166,6 +167,8 @@ where
     purge_manager: PurgeManager<E, W, P>,
 
     workers: Arc<RwLock<Workers>>,
+
+    flusher: Option<Arc<JoinHandle<()>>>,
 }
 
 impl<E, W, P> Engine<E, W, P>
@@ -350,17 +353,24 @@ where
         let engine = Engine {
             cfg,
             memtables,
-            pipe_log,
+            pipe_log: pipe_log.clone(),
             global_stats,
             purge_manager,
             workers: Arc::new(RwLock::new(Workers {
                 cache_evict: cache_evict_worker,
             })),
+            flusher: None,
         };
 
         engine.pipe_log.cache_submitor().block_on_full();
         engine.recover_from_queues()?;
         engine.pipe_log.cache_submitor().nonblock_on_full();
+
+        let th = ThreadBuilder::new()
+            .name("flusher".to_owned())
+            .spawn(move || pipe_log.run_flusher())
+            .unwrap();
+        engine.flusher = Some(Arc::new(th));
 
         Ok(engine)
     }
@@ -607,6 +617,28 @@ where
     /// If set sync true, the data will be persisted on disk by `fsync`.
     pub fn write(&self, log_batch: &mut LogBatch<E, W>, sync: bool) -> Result<usize> {
         self.write_impl(log_batch, sync)
+    }
+
+    pub fn write2(
+        &self,
+        log_batch: &mut LogBatch<E, W>,
+        sync: bool,
+        start_time_hint: u64,
+    ) -> Result<usize> {
+        if log_batch.items.is_empty() {
+            if sync {
+                self.pipe_log.sync(LogQueue::Append)?;
+            }
+            return Ok(0);
+        }
+        let (bytes, file_num) = self.pipe_log.write2(log_batch, sync, start_time_hint)?;
+        if file_num > 0 {
+            Self::apply_to_memtable(&self.memtables, log_batch, LogQueue::Append, file_num);
+            for hook in self.pipe_log.hooks() {
+                hook.post_apply_memtables(LogQueue::Append, file_num);
+            }
+        }
+        Ok(bytes)
     }
 
     /// Flush stats about EntryCache.

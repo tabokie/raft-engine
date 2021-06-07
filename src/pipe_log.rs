@@ -1,3 +1,4 @@
+use std::collections::binary_heap::BinaryHeap;
 use std::collections::VecDeque;
 use std::fs::{self, File};
 use std::io::{Error as IoError, ErrorKind as IoErrorKind, Read};
@@ -13,9 +14,10 @@ use nix::sys::stat::Mode;
 use nix::sys::uio::{pread, pwrite};
 use nix::unistd::{close, fsync, ftruncate, lseek, Whence};
 use nix::NixPath;
+use parking_lot::{Condvar, Mutex as Mutex2};
 use protobuf::Message;
 
-use crate::cache_evict::CacheSubmitor;
+use crate::cache_evict::{CacheSubmitor, CacheTracker};
 use crate::config::Config;
 use crate::log_batch::{EntryExt, LogBatch, LogItemContent};
 use crate::util::HandyRwLock;
@@ -61,6 +63,13 @@ pub trait GenericPipeLog: Sized + Clone + Send {
         sync: bool,
         file_num: &mut u64,
     ) -> Result<usize>;
+
+    fn write2<E: Message, W: EntryExt<E>>(
+        &self,
+        batch: &mut LogBatch<E, W>,
+        sync: bool,
+        start_time_hint: u64,
+    ) -> Result<(usize, u64)>;
 
     /// Rewrite a batch into the rewrite queue.
     fn rewrite<E: Message, W: EntryExt<E>>(
@@ -136,6 +145,84 @@ impl Drop for LogFd {
         if let Err(e) = self.close() {
             warn!("Drop LogFd fail: {}", e);
         }
+    }
+}
+
+pub struct Task {
+    hint: u64,
+    content: Vec<u8>,
+    sync: bool,
+    entries_size: usize,
+    mu: Mutex2<Option<Result<(usize, u64, u64, Option<CacheTracker>)>>>,
+    cv: Condvar,
+}
+
+impl Task {
+    pub fn new(content: Vec<u8>, sync: bool, entries_size: usize, hint: u64) -> Self {
+        Task {
+            hint,
+            content,
+            sync,
+            entries_size,
+            mu: Mutex2::new(None),
+            cv: Condvar::new(),
+        }
+    }
+
+    pub fn set(&self, res: Result<(usize, u64, u64, Option<CacheTracker>)>) {
+        let mut guard = self.mu.lock();
+        *guard = Some(res);
+        self.cv.notify_one();
+    }
+
+    pub fn wait(&self) -> Result<(usize, u64, u64, Option<CacheTracker>)> {
+        let guard = self.mu.lock();
+        while guard.is_none() {
+            self.cv.wait(&mut guard);
+        }
+        (*guard).unwrap()
+    }
+}
+
+impl PartialEq for Task {
+    fn eq(&self, other: &Self) -> bool {
+        self.hint == other.hint
+    }
+}
+impl Eq for Task {}
+
+impl Ord for Task {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        // reverse sort for max heap
+        other.hint.cmp(&self.hint)
+    }
+}
+
+// `PartialOrd` needs to be implemented as well.
+impl PartialOrd for Task {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+pub struct SortedTaskList {
+    inner: Mutex2<BinaryHeap<Task>>,
+}
+
+impl SortedTaskList {
+    pub fn new() -> Self {
+        SortedTaskList {
+            inner: Mutex2::new(BinaryHeap::new()),
+        }
+    }
+    pub fn insert(&self, task: Task) {
+        let inner = self.inner.lock();
+        inner.push(task);
+    }
+
+    pub fn pop(&self) -> Option<Task> {
+        let inner = self.inner.lock();
+        inner.pop()
     }
 }
 
@@ -341,6 +428,8 @@ pub struct PipeLog {
     rewriter: Arc<RwLock<LogManager>>,
     cache_submitor: Arc<Mutex<CacheSubmitor>>,
     hooks: Vec<Arc<dyn PipeLogHook>>,
+
+    pending: Arc<SortedTaskList>,
 }
 
 impl PipeLog {
@@ -362,6 +451,31 @@ impl PipeLog {
             rewriter,
             cache_submitor: Arc::new(Mutex::new(cache_submitor)),
             hooks,
+            pending: Arc::new(SortedTaskList::new()),
+        }
+    }
+
+    fn run_task(
+        &self,
+        submitor: &mut CacheSubmitor,
+        task: &mut Task,
+    ) -> Result<(usize, u64, u64, Option<CacheTracker>)> {
+        let (file_num, offset, fd) =
+            self.append(LogQueue::Append, &task.content, &mut task.sync)?;
+        let tracker = submitor.get_cache_tracker(file_num, offset, task.entries_size);
+        if task.sync {
+            fd.sync()?;
+        }
+        Ok((task.content.len(), file_num, offset, tracker))
+    }
+
+    pub fn run_flusher(&self) {
+        let mut cache_submitor = self.cache_submitor.lock().unwrap();
+        loop {
+            let task = self.pending.pop();
+            if let Some(task) = task {
+                task.set(self.run_task(&mut cache_submitor, &mut task));
+            }
         }
     }
 
@@ -528,6 +642,27 @@ impl GenericPipeLog for PipeLog {
             return Ok(content.len());
         }
         Ok(0)
+    }
+
+    fn write2<E: Message, W: EntryExt<E>>(
+        &self,
+        batch: &mut LogBatch<E, W>,
+        sync: bool,
+        start_time_hint: u64,
+    ) -> Result<(usize, u64)> {
+        if let Some(content) = batch.encode_to_bytes(self.compression_threshold) {
+            let task = Task::new(content, sync, batch.entries_size(), start_time_hint);
+            self.pending.insert(task);
+            let (bytes, file_num, offset, tracker) = task.wait()?;
+            for item in batch.items.iter_mut() {
+                if let LogItemContent::Entries(entries) = &mut item.content {
+                    entries.update_position(LogQueue::Append, file_num, offset, &tracker);
+                }
+            }
+            Ok((bytes, file_num))
+        } else {
+            Ok((0, 0))
+        }
     }
 
     fn rewrite<E: Message, W: EntryExt<E>>(
