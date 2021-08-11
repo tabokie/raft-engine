@@ -91,6 +91,7 @@ impl LogFd {
     fn close(&self) -> Result<()> {
         close(self.0).map_err(|e| parse_nix_error(e, "close"))
     }
+
     fn sync(&self) -> Result<()> {
         let start = Instant::now();
         let res = fsync(self.0).map_err(|e| parse_nix_error(e, "fsync"));
@@ -133,13 +134,13 @@ impl LogFd {
             .map_err(|e| parse_nix_error(e, "lseek"))
     }
 
-    fn truncate(&self, offset: i64) -> Result<i64> {
-        if FILE_MAGIC_HEADER.len() + Version::len() > offset as usize {
-            Ok((FILE_MAGIC_HEADER.len() + Version::len()) as i64)
-        } else {
-            ftruncate(self.0, offset).map_err(|e| parse_nix_error(e, "ftruncate"))?;
-            Ok(offset)
+    fn truncate(&self, mut offset: i64) -> Result<i64> {
+        let header_size = (FILE_MAGIC_HEADER.len() + Version::len()) as i64;
+        if offset < header_size {
+            offset = header_size;
         }
+        ftruncate(self.0, offset).map_err(|e| parse_nix_error(e, "ftruncate"))?;
+        Ok(offset)
     }
 
     fn read_header(&self) -> Result<()> {
@@ -220,6 +221,7 @@ struct LogManager {
     pub last_sync_size: usize,
 
     pub all_files: VecDeque<Arc<LogFd>>,
+    oldest_obsolete_file: FileId,
 }
 
 impl LogManager {
@@ -237,6 +239,7 @@ impl LogManager {
             active_log_capacity: 0,
             last_sync_size: 0,
             all_files: VecDeque::with_capacity(DEFAULT_FILES_COUNT),
+            oldest_obsolete_file: FileId::default(),
         }
     }
 
@@ -291,7 +294,20 @@ impl LogManager {
 
         let mut path = PathBuf::from(&self.dir);
         path.push(build_file_name(self.queue, self.active_file_id));
-        let fd = Arc::new(LogFd::create(&path)?);
+        let fd = if self.oldest_obsolete_file.valid() {
+            let mut old_path = PathBuf::from(&self.dir);
+            old_path.push(build_file_name(self.queue, self.oldest_obsolete_file));
+            std::fs::rename(&old_path, &path)?;
+            self.oldest_obsolete_file = self.oldest_obsolete_file.forward(1);
+            if self.oldest_obsolete_file >= self.first_file_id {
+                self.oldest_obsolete_file = FileId::default();
+            }
+            let fd = LogFd::open(&path)?;
+            fd.truncate(0)?;
+            Arc::new(fd)
+        } else {
+            Arc::new(LogFd::create(&path)?)
+        };
         let bytes = fd.file_size()?;
 
         self.active_log_size = bytes;
@@ -334,7 +350,10 @@ impl LogManager {
         if file_id < self.first_file_id || file_id > self.active_file_id {
             return Err(Error::Io(IoError::new(
                 IoErrorKind::NotFound,
-                "file_id out of range",
+                format!(
+                    "file_id {} out of range [{}, {}]",
+                    file_id, self.first_file_id, self.active_file_id
+                ),
             )));
         }
         Ok(self.all_files[file_id.step_after(&self.first_file_id).unwrap()].clone())
@@ -350,6 +369,9 @@ impl LogManager {
         }
         let end_offset = file_id.step_after(&self.first_file_id).unwrap();
         self.all_files.drain(..end_offset);
+        if !self.oldest_obsolete_file.valid() && file_id > self.first_file_id {
+            self.oldest_obsolete_file = self.first_file_id;
+        }
         self.first_file_id = file_id;
         self.update_metrics();
         Ok(end_offset)
@@ -709,16 +731,16 @@ impl PipeLog for FilePipeLog {
         let purge_count = manager.purge_to(file_id)?;
         drop(manager);
 
-        let mut cur_file_id = file_id.backward(purge_count);
-        for i in 0..purge_count {
-            let mut path = PathBuf::from(&self.dir);
-            path.push(build_file_name(queue, cur_file_id));
-            if let Err(e) = fs::remove_file(&path) {
-                warn!("Remove purged log file {:?} fail: {}", path, e);
-                return Ok(i);
-            }
-            cur_file_id = cur_file_id.forward(1);
-        }
+        // let mut cur_file_id = file_id.backward(purge_count);
+        // for i in 0..purge_count {
+        //     let mut path = PathBuf::from(&self.dir);
+        //     path.push(build_file_name(queue, cur_file_id));
+        //     if let Err(e) = fs::remove_file(&path) {
+        //         warn!("Remove purged log file {:?} fail: {}", path, e);
+        //         return Ok(i);
+        //     }
+        //     cur_file_id = cur_file_id.forward(1);
+        // }
         Ok(purge_count)
     }
 }
