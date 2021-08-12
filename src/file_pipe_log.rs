@@ -522,6 +522,9 @@ impl FilePipeLog {
         let mut log_manager = self.mut_queue(queue);
         let (file_id, offset, fd) = log_manager.on_append(content.len(), sync)?;
         fd.write(offset as i64, content)?;
+        if *sync {
+            fd.sync()?;
+        }
         for listener in &self.listeners {
             listener.on_append_log_file(queue, file_id);
         }
@@ -648,10 +651,7 @@ impl PipeLog for FilePipeLog {
     ) -> Result<(FileId, usize)> {
         if let Some(content) = batch.encode_to_bytes(self.compression_threshold) {
             let start = Instant::now();
-            let (file_id, offset, fd) = self.append_bytes(queue, &content, &mut sync)?;
-            if sync {
-                fd.sync()?;
-            }
+            let (file_id, offset, _fd) = self.append_bytes(queue, &content, &mut sync)?;
 
             batch.set_position(queue, file_id, offset);
 
