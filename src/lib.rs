@@ -12,10 +12,11 @@
 // limitations under the License.
 
 #![feature(shrink_to)]
-#![feature(cell_update)]
+#![feature(test)]
 
 #[macro_use]
 extern crate lazy_static;
+extern crate test;
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 

@@ -280,3 +280,41 @@ pub mod lz4 {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use raft::eraftpb::Entry;
+    use ::lz4::{Encoder, EncoderBuilder};
+    use protobuf::Message;
+
+    fn prepare_entry() -> Entry {
+        let mut data = Vec::with_capacity(10240);
+        for i in 0..10240 {
+            data.push((i*i) as u8);
+        }
+        Entry {
+            data: data.into(),
+            ..Default::default()
+        }
+    }
+
+    #[bench]
+    fn bench_lz4(b: &mut test::Bencher) {
+        let entry = prepare_entry();
+        let mut vec = Vec::with_capacity(4096);
+        b.iter(move || {
+            vec.extend_from_slice(&entry.write_to_bytes().unwrap());
+            vec = super::lz4::encode_block(&vec, 0, 0);
+        });
+    }
+
+    #[bench]
+    fn bench_lz4_stream(b: &mut test::Bencher) {
+        let entry = prepare_entry();
+        let vec = Vec::with_capacity(4096);
+        let mut encoder = EncoderBuilder::new().level(1).build(vec).unwrap();
+        b.iter(move || {
+            entry.write_to_writer(&mut encoder).unwrap();
+        });
+    }
+}
