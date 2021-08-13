@@ -13,7 +13,7 @@ use nix::errno::Errno;
 use nix::fcntl::{self, OFlag};
 use nix::sys::stat::Mode;
 use nix::sys::uio::{pread, pwrite};
-use nix::unistd::{close, fsync, ftruncate, lseek, Whence};
+use nix::unistd::{close, fdatasync, ftruncate, lseek, Whence};
 use nix::NixPath;
 use parking_lot::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 
@@ -93,7 +93,7 @@ impl LogFd {
     }
     fn sync(&self) -> Result<()> {
         let start = Instant::now();
-        let res = fsync(self.0).map_err(|e| parse_nix_error(e, "fsync"));
+        let res = fdatasync(self.0).map_err(|e| parse_nix_error(e, "fdatasync"));
         LOG_SYNC_TIME_HISTOGRAM.observe(start.saturating_elapsed().as_secs_f64());
         res
     }
