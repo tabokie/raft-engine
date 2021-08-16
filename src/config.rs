@@ -27,6 +27,8 @@ pub struct Config {
     ///
     /// Set to `0` will disable compression.
     pub batch_compression_threshold: ReadableSize,
+
+    pub sync_in_lock: bool,
 }
 
 impl Default for Config {
@@ -38,6 +40,7 @@ impl Default for Config {
             target_file_size: ReadableSize::mb(128),
             purge_threshold: ReadableSize::gb(10),
             batch_compression_threshold: ReadableSize::kb(8),
+            sync_in_lock: false,
         }
     }
 }

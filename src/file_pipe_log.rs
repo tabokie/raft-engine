@@ -410,6 +410,7 @@ pub struct FilePipeLog {
     rotate_size: usize,
     bytes_per_sync: usize,
     compression_threshold: usize,
+    sync_in_lock: bool,
 
     appender: Arc<RwLock<LogManager>>,
     rewriter: Arc<RwLock<LogManager>>,
@@ -427,6 +428,7 @@ impl FilePipeLog {
             rotate_size: cfg.target_file_size.0 as usize,
             bytes_per_sync: cfg.bytes_per_sync.0 as usize,
             compression_threshold: cfg.batch_compression_threshold.0 as usize,
+            sync_in_lock: cfg.sync_in_lock,
             appender,
             rewriter,
             listeners,
@@ -522,7 +524,7 @@ impl FilePipeLog {
         let mut log_manager = self.mut_queue(queue);
         let (file_id, offset, fd) = log_manager.on_append(content.len(), sync)?;
         fd.write(offset as i64, content)?;
-        if *sync {
+        if *sync && self.sync_in_lock {
             fd.sync()?;
         }
         for listener in &self.listeners {
@@ -651,7 +653,10 @@ impl PipeLog for FilePipeLog {
     ) -> Result<(FileId, usize)> {
         if let Some(content) = batch.encode_to_bytes(self.compression_threshold) {
             let start = Instant::now();
-            let (file_id, offset, _fd) = self.append_bytes(queue, &content, &mut sync)?;
+            let (file_id, offset, fd) = self.append_bytes(queue, &content, &mut sync)?;
+            if sync && !self.sync_in_lock {
+                fd.sync()?;
+            }
 
             batch.set_position(queue, file_id, offset);
 
