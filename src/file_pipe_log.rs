@@ -381,7 +381,7 @@ impl LogManager {
             let alloc_size = std::cmp::max(reserve, FILE_ALLOCATE_SIZE);
             fcntl::fallocate(
                 fd.0,
-                fcntl::FallocateFlags::FALLOC_FL_KEEP_SIZE,
+                fcntl::FallocateFlags::empty(),
                 self.active_log_capacity as _,
                 alloc_size as _,
             )
