@@ -243,6 +243,29 @@ pub mod lz4 {
         }
     }
 
+    pub fn encode_block_2(src: &[u8], dst: &mut Vec<u8>) {
+        unsafe {
+            let bound = lz4_sys::LZ4_compressBound(src.len() as i32);
+            assert!(bound > 0 && src.len() <= i32::MAX as usize);
+            dst.reserve(dst.len() + bound as usize);
+
+            let dst_ptr = dst.as_mut_ptr().add(dst.len());
+
+            // Layout: { decoded_len | content }.
+            let le_len = src.len().to_le_bytes();
+            ptr::copy_nonoverlapping(le_len.as_ptr(), dst_ptr, 4);
+
+            let size = lz4_sys::LZ4_compress_default(
+                src.as_ptr() as _,
+                dst_ptr.add(4) as _,
+                src.len() as i32,
+                bound,
+            );
+            assert!(size > 0);
+            dst.set_len(dst.len() + 4 + size as usize);
+        }
+    }
+
     pub fn decode_block(src: &[u8]) -> Vec<u8> {
         assert!(src.len() > 4, "data is too short: {} <= 4", src.len());
         unsafe {
@@ -303,18 +326,46 @@ mod tests {
         let entry = prepare_entry();
         let mut vec = Vec::with_capacity(4096);
         b.iter(move || {
-            vec.extend_from_slice(&entry.write_to_bytes().unwrap());
+            entry.write_to_vec(&mut vec).unwrap();
             vec = super::lz4::encode_block(&vec, 0, 0);
+            vec.clear();
+        });
+    }
+
+    #[bench]
+    fn bench_lz4_2(b: &mut test::Bencher) {
+        let entry = prepare_entry();
+        let mut vec = Vec::with_capacity(4096);
+        let mut vec2 = Vec::with_capacity(4096);
+        b.iter(move || {
+            entry.write_to_vec(&mut vec).unwrap();
+            super::lz4::encode_block_2(&vec, &mut vec2);
+            vec.clear();
+            vec2.clear();
         });
     }
 
     #[bench]
     fn bench_lz4_stream(b: &mut test::Bencher) {
         let entry = prepare_entry();
-        let vec = Vec::with_capacity(4096);
-        let mut encoder = EncoderBuilder::new().level(1).build(vec).unwrap();
+        let mut vec_holder = Some(Vec::with_capacity(4096));
         b.iter(move || {
+            let mut encoder = EncoderBuilder::new().level(1).build(vec_holder.take().unwrap()).unwrap();
             entry.write_to_writer(&mut encoder).unwrap();
+            let (mut vec, _) = encoder.finish();
+            vec.clear();
+            vec_holder = Some(vec);
+        });
+    }
+
+    #[bench]
+    fn bench_lz4_stream_encoder(b: &mut test::Bencher) {
+        let entry = prepare_entry();
+        let mut vec_holder = Some(Vec::with_capacity(4096));
+        b.iter(move || {
+            let mut encoder = EncoderBuilder::new().level(1).build(vec_holder.take().unwrap()).unwrap();
+            let (vec, _) = encoder.finish();
+            vec_holder = Some(vec);
         });
     }
 }
