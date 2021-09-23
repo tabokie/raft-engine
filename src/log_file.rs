@@ -1,7 +1,9 @@
 // Copyright (c) 2017-present, PingCAP, Inc. Licensed under Apache-2.0.
 
 use std::io::{Read, Result as IoResult, Seek, SeekFrom, Write};
-use std::os::unix::io::RawFd;
+use std::os::unix::io::{RawFd, AsRawFd};
+use std::fs::{File, OpenOptions};
+use std::path::Path;
 use std::sync::Arc;
 
 use fail::fail_point;
@@ -17,7 +19,7 @@ use nix::NixPath;
 ///
 /// This implementation is a thin wrapper around `RawFd`, and primarily targets
 /// UNIX-based systems.
-pub struct LogFd(RawFd);
+pub struct LogFd(File);
 
 fn from_nix_error(e: nix::Error, custom: &'static str) -> std::io::Error {
     match e {
@@ -30,49 +32,53 @@ fn from_nix_error(e: nix::Error, custom: &'static str) -> std::io::Error {
 }
 
 impl LogFd {
-    pub fn open<P: ?Sized + NixPath>(path: &P) -> IoResult<Self> {
-        let flags = OFlag::O_RDWR;
-        let mode = Mode::S_IRWXU;
-        fail_point!("log_fd_fadvise_dontneed", |_| {
-            let fd = LogFd(fcntl::open(path, flags, mode).map_err(|e| from_nix_error(e, "open"))?);
-            #[cfg(target_os = "linux")]
-            unsafe {
-                extern crate libc;
-                libc::posix_fadvise64(fd.0, 0, fd.file_size()? as i64, libc::POSIX_FADV_DONTNEED);
-            }
-            Ok(fd)
-        });
-        Ok(LogFd(
-            fcntl::open(path, flags, mode).map_err(|e| from_nix_error(e, "open"))?,
-        ))
+    pub fn open<P: AsRef<Path>>(path: &P) -> IoResult<Self> {
+        Ok(LogFd(OpenOptions::new().read(true).write(true).create(true).open(path)?))
+        // let flags = OFlag::O_RDWR;
+        // let mode = Mode::S_IRWXU;
+        // fail_point!("log_fd_fadvise_dontneed", |_| {
+        //     let fd = LogFd(fcntl::open(path, flags, mode).map_err(|e| from_nix_error(e, "open"))?);
+        //     #[cfg(target_os = "linux")]
+        //     unsafe {
+        //         extern crate libc;
+        //         libc::posix_fadvise64(fd.0, 0, fd.file_size()? as i64, libc::POSIX_FADV_DONTNEED);
+        //     }
+        //     Ok(fd)
+        // });
+        // Ok(LogFd(
+        //     fcntl::open(path, flags, mode).map_err(|e| from_nix_error(e, "open"))?,
+        // ))
     }
 
-    pub fn create<P: ?Sized + NixPath>(path: &P) -> IoResult<Self> {
-        let flags = OFlag::O_RDWR | OFlag::O_CREAT;
-        let mode = Mode::S_IRWXU;
-        let fd = fcntl::open(path, flags, mode).map_err(|e| from_nix_error(e, "open"))?;
-        Ok(LogFd(fd))
+    pub fn create<P: AsRef<Path>>(path: &P) -> IoResult<Self> {
+        Ok(LogFd(OpenOptions::new().read(true).write(true).create(true).open(path)?))
+        // let flags = OFlag::O_RDWR | OFlag::O_CREAT;
+        // let mode = Mode::S_IRWXU;
+        // let fd = fcntl::open(path, flags, mode).map_err(|e| from_nix_error(e, "open"))?;
+        // Ok(LogFd(fd))
     }
 
     pub fn close(&self) -> IoResult<()> {
-        close(self.0).map_err(|e| from_nix_error(e, "close"))
+        Ok(())
+        // close(self.0).map_err(|e| from_nix_error(e, "close"))
     }
 
     pub fn sync(&self) -> IoResult<()> {
-        #[cfg(target_os = "linux")]
-        {
-            nix::unistd::fdatasync(self.0).map_err(|e| from_nix_error(e, "fdatasync"))
-        }
-        #[cfg(not(target_os = "linux"))]
-        {
-            nix::unistd::fsync(self.0).map_err(|e| from_nix_error(e, "fsync"))
-        }
+        self.0.sync_data()
+        // #[cfg(target_os = "linux")]
+        // {
+        //     nix::unistd::fdatasync(self.0).map_err(|e| from_nix_error(e, "fdatasync"))
+        // }
+        // #[cfg(not(target_os = "linux"))]
+        // {
+        //     nix::unistd::fsync(self.0).map_err(|e| from_nix_error(e, "fsync"))
+        // }
     }
 
     pub fn read(&self, mut offset: usize, buf: &mut [u8]) -> IoResult<usize> {
         let mut readed = 0;
         while readed < buf.len() {
-            let bytes = match pread(self.0, &mut buf[readed..], offset as i64) {
+            let bytes = match pread(self.0.as_raw_fd(), &mut buf[readed..], offset as i64) {
                 Ok(bytes) => bytes,
                 Err(e) if e.as_errno() == Some(Errno::EAGAIN) => continue,
                 Err(e) => return Err(from_nix_error(e, "pread")),
@@ -90,7 +96,7 @@ impl LogFd {
     pub fn write(&self, mut offset: usize, content: &[u8]) -> IoResult<usize> {
         let mut written = 0;
         while written < content.len() {
-            let bytes = match pwrite(self.0, &content[written..], offset as i64) {
+            let bytes = match pwrite(self.0.as_raw_fd(), &content[written..], offset as i64) {
                 Ok(bytes) => bytes,
                 Err(e) if e.as_errno() == Some(Errno::EAGAIN) => continue,
                 Err(e) => return Err(from_nix_error(e, "pwrite")),
@@ -105,20 +111,20 @@ impl LogFd {
     }
 
     pub fn file_size(&self) -> IoResult<usize> {
-        lseek(self.0, 0, Whence::SeekEnd)
+        lseek(self.0.as_raw_fd(), 0, Whence::SeekEnd)
             .map(|n| n as usize)
             .map_err(|e| from_nix_error(e, "lseek"))
     }
 
     pub fn truncate(&self, offset: usize) -> IoResult<()> {
-        ftruncate(self.0, offset as i64).map_err(|e| from_nix_error(e, "ftruncate"))
+        ftruncate(self.0.as_raw_fd(), offset as i64).map_err(|e| from_nix_error(e, "ftruncate"))
     }
 
     pub fn allocate(&self, offset: usize, size: usize) -> IoResult<()> {
         #[cfg(target_os = "linux")]
         {
             fcntl::fallocate(
-                self.0,
+                self.0.as_raw_fd(),
                 fcntl::FallocateFlags::empty(),
                 offset as i64,
                 size as i64,
@@ -132,13 +138,13 @@ impl LogFd {
     }
 }
 
-impl Drop for LogFd {
-    fn drop(&mut self) {
-        if let Err(e) = self.close() {
-            error!("error while closing file: {}", e);
-        }
-    }
-}
+// impl Drop for LogFd {
+//     fn drop(&mut self) {
+//         if let Err(e) = self.close() {
+//             error!("error while closing file: {}", e);
+//         }
+//     }
+// }
 
 /// A `LogFile` is a `LogFd` wrapper that implements `Seek`, `Write` and `Read`.
 pub struct LogFile {
