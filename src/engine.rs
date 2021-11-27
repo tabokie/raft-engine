@@ -365,7 +365,22 @@ where
         raft_groups: &[u64],
         file_builder: Arc<B>,
     ) -> Result<Vec<LogItem>> {
-        todo!()
+        let mut reader = if path.is_dir() {
+            crate::file_pipe_log::debug::LogItemReader::new_directory_reader(
+                file_builder.clone(),
+                path,
+            )?
+        } else {
+            crate::file_pipe_log::debug::LogItemReader::new_file_reader(file_builder.clone(), path)?
+        };
+        let mut items = Vec::new();
+        while let Some(item) = reader.next() {
+            let item = item?;
+            if raft_groups.is_empty() || raft_groups.contains(&item.raft_group_id) {
+                items.push(item);
+            }
+        }
+        Ok(items)
     }
 }
 

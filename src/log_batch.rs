@@ -247,6 +247,29 @@ pub enum LogItemContent {
 }
 
 impl LogItem {
+    pub fn dump(&self) {
+        match &self.content {
+            LogItemContent::EntryIndexes(EntryIndexes(idxs)) => {
+                if idxs.is_empty() {
+                    println!("rid={}, empty", self.raft_group_id);
+                } else {
+                    println!(
+                        "rid={}, first={}, last={}",
+                        self.raft_group_id,
+                        idxs.first().unwrap().index,
+                        idxs.last().unwrap().index
+                    );
+                }
+            }
+            LogItemContent::Command(cmd) => {
+                println!("rid={}, command={:?}", self.raft_group_id, cmd);
+            }
+            LogItemContent::Kv(KeyValue { op_type, .. }) => {
+                println!("rid={}, kv={:?}", self.raft_group_id, op_type);
+            }
+        }
+    }
+
     pub fn new_entry_indexes(raft_group_id: u64, entry_indexes: Vec<EntryIndex>) -> LogItem {
         LogItem {
             raft_group_id,

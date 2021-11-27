@@ -89,7 +89,7 @@ impl MemTable {
     pub fn merge_newer_neighbor(&mut self, rhs: &mut Self) {
         debug_assert_eq!(self.region_id, rhs.region_id);
         if let Some((rhs_first, _)) = rhs.span() {
-            self.prepare_append(rhs_first, false, true);
+            self.prepare_append(rhs_first, rhs.rewrite_count > 0 /*allow_hole*/, true /*allow_overwrite*/);
             self.global_stats.add(
                 rhs.entry_indexes[0].entries.unwrap().id.queue,
                 rhs.entry_indexes.len(),

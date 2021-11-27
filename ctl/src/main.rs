@@ -96,7 +96,7 @@ impl ControlOpt {
             println!("No data");
         } else {
             println!("Raft entrys are as follows:\n");
-            r.iter().for_each(|entry| println!("{:?}", entry));
+            r.iter().for_each(|entry| entry.dump());
         }
 
         Ok(())
