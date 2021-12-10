@@ -674,10 +674,19 @@ impl MemTableAccessor {
     }
 
     pub fn apply(&self, log_items: LogItemDrain, queue: LogQueue) {
+        let mut last_memtable = (0, None);
         for item in log_items {
-            let raft = item.raft_group_id;
-            let memtable = self.get_or_insert(raft);
-            fail_point!("memtable_accessor::apply::region_3", raft == 3, |_| {});
+            let rid = item.raft_group_id;
+            if let LogItemContent::Command(Command::Clean) = item.content {
+                self.remove(rid, queue);
+                continue;
+            }
+            let memtable = if last_memtable.0 == rid && last_memtable.1.is_some() {
+                last_memtable.1.take().unwrap()
+            } else {
+                self.get_or_insert(rid)
+            };
+            fail_point!("memtable_accessor::apply::region_3", rid == 3, |_| {});
             match item.content {
                 LogItemContent::EntryIndexes(entries_to_add) => {
                     let entry_indexes = entries_to_add.0;
@@ -686,9 +695,6 @@ impl MemTableAccessor {
                     } else {
                         memtable.write().append(entry_indexes);
                     }
-                }
-                LogItemContent::Command(Command::Clean) => {
-                    self.remove(raft, queue);
                 }
                 LogItemContent::Command(Command::Compact { index }) => {
                     memtable.write().compact_to(index);
@@ -703,7 +709,9 @@ impl MemTableAccessor {
                         memtable.write().delete(key.as_slice());
                     }
                 },
+                _ => unreachable!(),
             }
+            last_memtable = (rid, Some(memtable));
         }
     }
 
@@ -1745,7 +1753,10 @@ mod tests {
         let memtables = MemTableAccessor::new(Arc::new(GlobalStats::default()));
         let mut item_batch = LogItemBatch::default();
         let rid = 7;
-        item_batch.add_entry_indexes(rid, generate_entry_indexes(1, 11, FileId::dummy(LogQueue::Append)));
+        item_batch.add_entry_indexes(
+            rid,
+            generate_entry_indexes(1, 11, FileId::dummy(LogQueue::Append)),
+        );
         item_batch.put(rid, b"last_index".to_vec(), b"some_index_value".to_vec());
         item_batch.finish_write(FileBlockHandle {
             id: FileId::new(LogQueue::Append, 0),
@@ -1758,12 +1769,22 @@ mod tests {
     }
 
     #[bench]
-    fn bench_memtables_triple_applys(b: &mut test::Bencher) {
+    fn bench_memtables_multi_applys(b: &mut test::Bencher) {
         let memtables = MemTableAccessor::new(Arc::new(GlobalStats::default()));
         let mut item_batch = LogItemBatch::default();
-        let rids = [7, 17, 137];
+        // 16 regions.
+        let rids = [
+            7, 777, 17, 137, 1777, 177373, 177777, 377, 37377, 397379, 77, 77777, 737737, 97,
+            979777, 9977,
+        ];
         for rid in &rids {
-            item_batch.add_entry_indexes(*rid, generate_entry_indexes(1, 11, FileId::dummy(LogQueue::Append)));
+            memtables.get_or_insert(*rid);
+        }
+        for rid in &rids {
+            item_batch.add_entry_indexes(
+                *rid,
+                generate_entry_indexes(1, 11, FileId::dummy(LogQueue::Append)),
+            );
         }
         for rid in &rids {
             item_batch.put(*rid, b"last_index".to_vec(), b"some_index_value".to_vec());

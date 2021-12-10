@@ -370,6 +370,7 @@ impl LogItemBatch {
     pub fn drain(&mut self) -> LogItemDrain {
         self.item_size = 0;
         self.entries_size = 0;
+        self.items.sort_unstable_by_key(|i| i.raft_group_id);
         self.items.drain(..)
     }
 
