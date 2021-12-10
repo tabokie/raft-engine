@@ -1739,4 +1739,42 @@ mod tests {
             memtable.put(key2.clone(), value.clone(), FileId::dummy(LogQueue::Append));
         });
     }
+
+    #[bench]
+    fn bench_memtables_single_apply(b: &mut test::Bencher) {
+        let memtables = MemTableAccessor::new(Arc::new(GlobalStats::default()));
+        let mut item_batch = LogItemBatch::default();
+        let rid = 7;
+        item_batch.add_entry_indexes(rid, generate_entry_indexes(1, 11, FileId::dummy(LogQueue::Append)));
+        item_batch.put(rid, b"last_index".to_vec(), b"some_index_value".to_vec());
+        item_batch.finish_write(FileBlockHandle {
+            id: FileId::new(LogQueue::Append, 0),
+            offset: 0,
+            len: 0,
+        });
+        b.iter(move || {
+            memtables.apply(item_batch.clone().drain(), LogQueue::Append);
+        });
+    }
+
+    #[bench]
+    fn bench_memtables_triple_applys(b: &mut test::Bencher) {
+        let memtables = MemTableAccessor::new(Arc::new(GlobalStats::default()));
+        let mut item_batch = LogItemBatch::default();
+        let rids = [7, 17, 137];
+        for rid in &rids {
+            item_batch.add_entry_indexes(*rid, generate_entry_indexes(1, 11, FileId::dummy(LogQueue::Append)));
+        }
+        for rid in &rids {
+            item_batch.put(*rid, b"last_index".to_vec(), b"some_index_value".to_vec());
+        }
+        item_batch.finish_write(FileBlockHandle {
+            id: FileId::new(LogQueue::Append, 0),
+            offset: 0,
+            len: 0,
+        });
+        b.iter(move || {
+            memtables.apply(item_batch.clone().drain(), LogQueue::Append);
+        });
+    }
 }

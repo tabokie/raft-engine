@@ -12,6 +12,7 @@ use clap::{crate_authors, crate_version, AppSettings, Parser};
 
 use const_format::formatcp;
 use hdrhistogram::Histogram;
+use kvproto::raft_serverpb::RaftLocalState;
 use parking_lot_core::SpinWait;
 use raft::eraftpb::Entry;
 use raft_engine::{
@@ -401,7 +402,9 @@ fn spawn_write(
                     ..Default::default()
                 });
             }
+            let mut states = Vec::with_capacity(args.write_region_count as usize);
             while !shutdown.load(Ordering::Relaxed) {
+                states.clear();
                 // TODO(tabokie): scattering regions in one batch
                 let mut rid = thread_rng().gen_range(0..(args.regions / args.write_threads))
                     * args.write_threads
@@ -413,6 +416,7 @@ fn spawn_write(
                     log_batch
                         .add_entries::<MessageExtTyped>(rid, &entries)
                         .unwrap();
+                    states.push((rid, last + args.write_entry_count));
                     if args.compact_count > 0 && last - first + 1 > args.compact_count {
                         log_batch.add_command(
                             rid,
@@ -422,6 +426,16 @@ fn spawn_write(
                         );
                     }
                     rid += args.write_threads;
+                }
+                let mut state = RaftLocalState {
+                    last_index: 0,
+                    ..Default::default()
+                };
+                for (rid, last_index) in &states {
+                    state.last_index = *last_index;
+                    log_batch
+                        .put_message(*rid, b"last_index".to_vec(), &state)
+                        .unwrap();
                 }
                 let mut start = Instant::now();
                 if let (Some(i), Some(last)) = (min_interval, summary.last) {
