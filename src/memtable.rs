@@ -7,6 +7,7 @@ use std::sync::Arc;
 use fail::fail_point;
 use hashbrown::HashMap;
 use parking_lot::{Mutex, RwLock};
+use strum::EnumCount;
 
 use crate::file_pipe_log::ReplayMachine;
 use crate::log_batch::{
@@ -18,10 +19,9 @@ use crate::pipe_log::{FileBlockHandle, FileId, FileSeq, LogQueue};
 use crate::util::slices_in_range;
 use crate::{Error, GlobalStats, Result};
 
-/// Attempt to shrink entry container if its capacity exceeds the threshold.
-const SHRINK_CAPACITY_THRESHOLD: usize = 512;
-/// Target capacity to shrink entry container.
-const SHRINK_CAPACITY_TARGET: usize = 64;
+/// Attempt to shrink entry container if its capacity reaches the threshold.
+const ENTRY_CAPACITY_SHRINK_THRESHOLD: usize = 1024 - 1;
+const ENTRY_CAPACITY_INIT: usize = 32 - 1;
 /// Number of hash table to store [`MemTable`].
 const MEMTABLE_SLOT_COUNT: usize = 128;
 
@@ -33,24 +33,167 @@ pub struct EntryIndex {
 
     /// File location of the group of entries that this entry belongs to.
     pub entries: Option<FileBlockHandle>,
-    // How its group of entries is compacted.
+    /// How its group of entries is compressed.
     pub compression_type: CompressionType,
 
     /// The relative offset within its group of entries.
-    pub entry_offset: u64,
+    pub entry_offset: u32,
     /// The encoded length within its group of entries.
-    pub entry_len: usize,
+    pub entry_len: u32,
 }
 
 impl Default for EntryIndex {
-    fn default() -> EntryIndex {
-        EntryIndex {
+    fn default() -> Self {
+        Self {
             index: 0,
             entries: None,
             compression_type: CompressionType::None,
             entry_offset: 0,
             entry_len: 0,
         }
+    }
+}
+
+impl EntryIndex {
+    fn new_with(index: u64, entries: &EntriesHandle, entry: &EntryHandle) -> Self {
+        EntryIndex {
+            index,
+            entries: Some(entries.block),
+            compression_type: entries.compression_type,
+            entry_offset: entry.offset,
+            entry_len: entry.len,
+        }
+    }
+
+    fn get_entries_handle(&self) -> EntriesHandle {
+        EntriesHandle {
+            block: self.entries.unwrap(),
+            compression_type: self.compression_type,
+        }
+    }
+}
+
+/// Location of a group of entries.
+#[derive(Debug, Copy, Clone, PartialEq)]
+struct EntriesHandle {
+    /// File location of the group of entries that this entry belongs to.
+    block: FileBlockHandle,
+    /// How its group of entries is compressed.
+    compression_type: CompressionType,
+}
+
+/// Relative location of one single entry.
+#[derive(Debug, Copy, Clone, PartialEq)]
+struct EntryHandle {
+    /// The relative offset within its group of entries.
+    offset: u32,
+    /// The encoded length within its group of entries.
+    len: u32,
+    /// Internal address of its [`EntriesHandle`].
+    entries_addr: StableAddress,
+    /// A cached value of log queue. Must be set when `entries_addr` is
+    /// set.
+    queue: LogQueue,
+}
+
+/// [`VecDeque`] with a few twists:
+///
+/// - All items are indexed by [`StableAddress`], i.e. the addresses for
+/// existing items will not be changed unless otherwise noticed.
+/// - Only unique items will be stored. Adding a duplicate item will return an
+/// address to the previous existing one.
+struct StableVecDeque<T> {
+    inner: VecDeque<T>,
+    start_addr: StableAddress,
+}
+
+/// The address used to locate an item in [`StableVecDeque`].
+#[derive(Debug, Copy, Clone, PartialEq)]
+struct StableAddress(u32);
+
+impl<T: std::cmp::PartialEq> StableVecDeque<T> {
+    fn new(capacity: usize) -> Self {
+        Self {
+            inner: VecDeque::with_capacity(capacity),
+            // Test overflow handling.
+            #[cfg(test)]
+            start_addr: StableAddress(u32::MAX),
+            #[cfg(not(test))]
+            start_addr: StableAddress(0),
+        }
+    }
+
+    #[inline]
+    fn push_back(&mut self, item: T) -> StableAddress {
+        if self.inner.is_empty() || self.inner[self.inner.len() - 1] != item {
+            self.inner.push_back(item);
+        }
+        self.start_addr + (self.inner.len() - 1)
+    }
+
+    /// Removes all items with addresses smaller than `addr`. `addr` itself
+    /// must point to an existing item.
+    #[inline]
+    fn pop_before(&mut self, addr: StableAddress) {
+        let count = addr - self.start_addr;
+        self.inner.drain(..count);
+        self.start_addr = addr;
+    }
+
+    /// Removes all items with addresses larger than `addr`. `addr` itself
+    /// must point to an existing item.
+    #[inline]
+    fn pop_after(&mut self, addr: StableAddress) {
+        let count = addr - self.start_addr;
+        self.inner.truncate(count + 1);
+    }
+
+    /// Appends all items from `rhs`, leaving it empty. Returns the address
+    /// change for all items in `rhs`.
+    #[inline]
+    fn unsafe_append(&mut self, rhs: &mut Self) -> usize {
+        let self_len = self.inner.len();
+        self.inner.append(&mut rhs.inner);
+        (self.start_addr + self_len) - rhs.start_addr
+    }
+
+    #[inline]
+    fn clear(&mut self) {
+        self.inner.clear();
+        self.start_addr = StableAddress(0);
+    }
+
+    #[inline]
+    fn at(&self, addr: StableAddress) -> &T {
+        &self.inner[addr - self.start_addr]
+    }
+
+    #[inline]
+    fn shrink(&mut self, threshold: usize) {
+        if self.inner.capacity() >= threshold {
+            self.inner.shrink_to_fit();
+        }
+    }
+}
+
+impl std::ops::Add<usize> for StableAddress {
+    type Output = StableAddress;
+    fn add(self, rhs: usize) -> Self::Output {
+        StableAddress(self.0.wrapping_add(rhs as u32))
+    }
+}
+
+impl std::ops::Sub<usize> for StableAddress {
+    type Output = StableAddress;
+    fn sub(self, rhs: usize) -> Self::Output {
+        StableAddress(self.0.wrapping_sub(rhs as u32))
+    }
+}
+
+impl std::ops::Sub<StableAddress> for StableAddress {
+    type Output = usize;
+    fn sub(self, rhs: StableAddress) -> Self::Output {
+        self.0.wrapping_sub(rhs.0) as usize
     }
 }
 
@@ -62,9 +205,13 @@ pub struct MemTable {
     /// The ID of current Raft Group.
     region_id: u64,
 
-    /// Container of entries. Incoming entries are pushed to the back with
-    /// ascending log indexes.
-    entry_indexes: VecDeque<EntryIndex>,
+    /// Containers of [`EntriesHandle`]s, indexes by [`LogQueue`].
+    entries_handles: [StableVecDeque<EntriesHandle>; LogQueue::COUNT],
+    /// Container of [`EntryHandle`]s. Incoming entries are pushed to the back
+    /// with ascending log indexes.
+    entry_handles: VecDeque<EntryHandle>,
+    /// The log index of the first entry.
+    first_index: u64,
     /// The amount of rewritten entries. Rewritten entries are the oldest
     /// entries and stored at the front of the container.
     rewrite_count: usize,
@@ -80,7 +227,12 @@ impl MemTable {
     pub fn new(region_id: u64, global_stats: Arc<GlobalStats>) -> MemTable {
         MemTable {
             region_id,
-            entry_indexes: VecDeque::with_capacity(SHRINK_CAPACITY_TARGET),
+            entries_handles: [
+                StableVecDeque::new(ENTRY_CAPACITY_INIT / 2),
+                StableVecDeque::new(ENTRY_CAPACITY_INIT / 2),
+            ],
+            entry_handles: VecDeque::with_capacity(ENTRY_CAPACITY_INIT),
+            first_index: 0,
             rewrite_count: 0,
             kvs: BTreeMap::default(),
             global_stats,
@@ -93,21 +245,32 @@ impl MemTable {
     pub fn merge_newer_neighbor(&mut self, rhs: &mut Self) {
         debug_assert_eq!(self.region_id, rhs.region_id);
         if let Some((rhs_first, _)) = rhs.span() {
+            let queue = if rhs.rewrite_count > 0 {
+                LogQueue::Rewrite
+            } else {
+                LogQueue::Append
+            };
             self.prepare_append(
                 rhs_first,
                 // Rewrite -> Compact Append -> Rewrite.
                 // TODO: add test case.
-                rhs.rewrite_count > 0, /* allow_hole */
+                queue == LogQueue::Rewrite, /* allow_hole */
                 // Always true, because `self` might not have all entries in
                 // history.
                 true, /* allow_overwrite */
             );
-            self.global_stats.add(
-                rhs.entry_indexes[0].entries.unwrap().id.queue,
-                rhs.entry_indexes.len(),
-            );
+            self.global_stats.add(queue, rhs.entry_handles.len());
             self.rewrite_count += rhs.rewrite_count;
-            self.entry_indexes.append(&mut rhs.entry_indexes);
+
+            let diff = self.entries_handles[queue as usize]
+                .unsafe_append(&mut rhs.entries_handles[queue as usize]);
+
+            let rhs_len = rhs.entry_handles.len();
+            self.entry_handles.append(&mut rhs.entry_handles);
+            for entry in self.entry_handles.iter_mut().rev().take(rhs_len) {
+                entry.entries_addr = entry.entries_addr + diff;
+            }
+
             rhs.rewrite_count = 0;
         }
 
@@ -126,8 +289,14 @@ impl MemTable {
     /// This method is only used for recovery.
     pub fn merge_append_table(&mut self, rhs: &mut Self) {
         debug_assert_eq!(self.region_id, rhs.region_id);
-        debug_assert_eq!(self.rewrite_count, self.entry_indexes.len());
+        debug_assert_eq!(self.rewrite_count, self.entry_handles.len());
+        debug_assert!(self.entries_handles[LogQueue::Append as usize]
+            .inner
+            .is_empty());
         debug_assert_eq!(rhs.rewrite_count, 0);
+        debug_assert!(rhs.entries_handles[LogQueue::Rewrite as usize]
+            .inner
+            .is_empty());
 
         if let Some((first, _)) = rhs.span() {
             self.prepare_append(
@@ -139,11 +308,15 @@ impl MemTable {
                 // Compact -> Rewrite -> Data loss of the compact command.
                 true, /* allow_overwrite */
             );
-            self.global_stats.add(
-                rhs.entry_indexes[0].entries.unwrap().id.queue,
-                rhs.entry_indexes.len(),
+            self.global_stats
+                .add(rhs.entry_handles[0].queue, rhs.entry_handles.len());
+
+            std::mem::swap(
+                &mut self.entries_handles[LogQueue::Append as usize],
+                &mut rhs.entries_handles[LogQueue::Append as usize],
             );
-            self.entry_indexes.append(&mut rhs.entry_indexes);
+
+            self.entry_handles.append(&mut rhs.entry_handles);
         }
 
         for (key, (value, file_id)) in rhs.kvs.iter() {
@@ -211,8 +384,12 @@ impl MemTable {
             }
 
             let ioffset = (index - first) as usize;
-            let entry_index = self.entry_indexes[ioffset];
-            Some(entry_index)
+            let entry_handle = &self.entry_handles[ioffset];
+            Some(EntryIndex::new_with(
+                index,
+                self.get_entries_handle(entry_handle),
+                entry_handle,
+            ))
         } else {
             None
         }
@@ -229,7 +406,7 @@ impl MemTable {
     ///
     /// Panics if incoming entries contains indexes that might be compacted
     /// before (overwrite history).
-    pub fn append(&mut self, entry_indexes: Vec<EntryIndex>) {
+    pub fn append(&mut self, mut entry_indexes: Vec<EntryIndex>) {
         let len = entry_indexes.len();
         if len > 0 {
             self.prepare_append(
@@ -238,8 +415,18 @@ impl MemTable {
                 false, /* allow_overwrite */
             );
             self.global_stats.add(LogQueue::Append, len);
-            // TODO: Optimize this.
-            self.entry_indexes.extend(entry_indexes);
+            let entries_handle = entry_indexes[0].get_entries_handle();
+            let queue = entries_handle.block.id.queue;
+            let addr = self.entries_handles[queue as usize].push_back(entries_handle);
+            for ei in &mut entry_indexes {
+                debug_assert_eq!(entries_handle, ei.get_entries_handle());
+                self.entry_handles.push_back(EntryHandle {
+                    offset: ei.entry_offset,
+                    len: ei.entry_len,
+                    entries_addr: addr,
+                    queue,
+                });
+            }
         }
     }
 
@@ -247,10 +434,10 @@ impl MemTable {
     /// append data.
     ///
     /// This method is only used for recovery.
-    pub fn append_rewrite(&mut self, entry_indexes: Vec<EntryIndex>) {
+    pub fn append_rewrite(&mut self, mut entry_indexes: Vec<EntryIndex>) {
         let len = entry_indexes.len();
         if len > 0 {
-            debug_assert_eq!(self.rewrite_count, self.entry_indexes.len());
+            debug_assert_eq!(self.rewrite_count, self.entry_handles.len());
             self.prepare_append(
                 entry_indexes[0].index,
                 // Rewrite -> Compact Append -> Rewrite.
@@ -261,8 +448,19 @@ impl MemTable {
                 true, /* allow_overwrite */
             );
             self.global_stats.add(LogQueue::Rewrite, len);
-            self.entry_indexes.extend(entry_indexes);
-            self.rewrite_count = self.entry_indexes.len();
+            let entries_handle = entry_indexes[0].get_entries_handle();
+            let queue = entries_handle.block.id.queue;
+            let addr = self.entries_handles[queue as usize].push_back(entries_handle);
+            for ei in &mut entry_indexes {
+                debug_assert_eq!(entries_handle, ei.get_entries_handle());
+                self.entry_handles.push_back(EntryHandle {
+                    offset: ei.entry_offset,
+                    len: ei.entry_len,
+                    entries_addr: addr,
+                    queue,
+                });
+            }
+            self.rewrite_count = self.entry_handles.len();
         }
     }
 
@@ -275,22 +473,20 @@ impl MemTable {
     ///
     /// Panics if index of the first entry in `rewrite_indexes` is greater than
     /// largest existing rewritten index + 1 (hole).
-    pub fn rewrite(&mut self, rewrite_indexes: Vec<EntryIndex>, gate: Option<FileSeq>) {
+    pub fn rewrite(&mut self, mut rewrite_indexes: Vec<EntryIndex>, gate: Option<FileSeq>) {
         if rewrite_indexes.is_empty() {
             return;
         }
         self.global_stats
             .add(LogQueue::Rewrite, rewrite_indexes.len());
-
-        let len = self.entry_indexes.len();
+        let len = self.entry_handles.len();
         if len == 0 {
             self.global_stats
                 .delete(LogQueue::Rewrite, rewrite_indexes.len());
             return;
         }
-
-        let first = self.entry_indexes[0].index;
-        let last = self.entry_indexes[len - 1].index;
+        let first = self.first_index;
+        let last = self.first_index + len as u64 - 1;
         let rewrite_first = std::cmp::max(rewrite_indexes[0].index, first);
         let rewrite_last = std::cmp::min(rewrite_indexes[rewrite_indexes.len() - 1].index, last);
         let mut rewrite_len = (rewrite_last + 1).saturating_sub(rewrite_first) as usize;
@@ -301,58 +497,105 @@ impl MemTable {
         }
 
         let pos = (rewrite_first - first) as usize;
-        // No normal log entry mixed in rewritten entries at the front.
+        // Adjacent to rewrite entries.
+        assert!(pos == 0 || self.entry_handles[pos - 1].queue == LogQueue::Rewrite);
+        // For rewrite-append operation, only oldest append entries will be rewritten.
         assert!(
-            pos == 0 || self.entry_indexes[pos - 1].entries.unwrap().id.queue == LogQueue::Rewrite
+            gate.is_none()
+                || self.entry_handles[pos].queue == LogQueue::Append && self.rewrite_count == pos
         );
         let rewrite_pos = (rewrite_first - rewrite_indexes[0].index) as usize;
-
+        let entries = rewrite_indexes[0].get_entries_handle();
+        let addr = self.entries_handles[LogQueue::Rewrite as usize].push_back(entries);
         for (i, rindex) in rewrite_indexes[rewrite_pos..rewrite_pos + rewrite_len]
-            .iter()
+            .iter_mut()
             .enumerate()
         {
-            let index = &mut self.entry_indexes[i + pos];
+            debug_assert_eq!(entries, rindex.get_entries_handle());
+            let entry_handle = &self.entry_handles[i + pos];
+            let old_queue = entry_handle.queue;
+            let entries_handle = self.get_entries_handle(entry_handle);
             if let Some(gate) = gate {
-                debug_assert_eq!(index.entries.unwrap().id.queue, LogQueue::Append);
-                if index.entries.unwrap().id.seq > gate {
+                debug_assert_eq!(old_queue, LogQueue::Append);
+                if entries_handle.block.id.seq > gate {
                     // Some entries are overwritten by new appends.
                     rewrite_len = i;
                     break;
                 }
-            } else if index.entries.unwrap().id.queue == LogQueue::Append {
+            } else if old_queue == LogQueue::Append {
                 // Squeeze operation encounters a new append.
                 rewrite_len = i;
                 break;
             }
 
-            *index = *rindex;
+            self.entry_handles[i + pos] = EntryHandle {
+                offset: rindex.entry_offset,
+                len: rindex.entry_len,
+                entries_addr: addr,
+                queue: LogQueue::Rewrite,
+            };
         }
 
+        // Update statistics and clean up dangling EntriesHandle-s.
         if gate.is_none() {
+            // Squeeze operation.
+            let next_rewrite_idx = pos + rewrite_len;
+            if next_rewrite_idx == self.rewrite_count {
+                // All rewrite entries are renewed.
+                self.entries_handles[LogQueue::Rewrite as usize]
+                    .pop_before(self.entry_handles[0].entries_addr);
+            } else {
+                // Squeeze operation can not modify `rewrite_count`.
+                assert!(next_rewrite_idx < self.rewrite_count);
+                // Entries smaller than `next_rewrite_idx` are newly rewritten.
+                // `next_rewrite_idx` is the oldest remaining entry.
+                // TODO: add test case for a squeeze operation split into several writes.
+                self.entries_handles[LogQueue::Rewrite as usize]
+                    .pop_before(self.entry_handles[next_rewrite_idx].entries_addr);
+            }
             self.global_stats
                 .delete(LogQueue::Rewrite, rewrite_indexes.len());
         } else {
+            // Rewrite-append operation.
+            self.rewrite_count += rewrite_len;
+            if self.rewrite_count == len {
+                // All append entries are rewritten.
+                self.entries_handles[LogQueue::Append as usize].clear();
+            } else {
+                self.entries_handles[LogQueue::Append as usize]
+                    .pop_before(self.entry_handles[self.rewrite_count].entries_addr);
+            }
             self.global_stats.delete(LogQueue::Append, rewrite_len);
             self.global_stats
                 .delete(LogQueue::Rewrite, rewrite_indexes.len() - rewrite_len);
         }
-
-        self.rewrite_count = pos + rewrite_len;
     }
 
     /// Removes all entries with index smaller than `index`. Returns the number
     /// of deleted entries.
     pub fn compact_to(&mut self, index: u64) -> u64 {
-        if self.entry_indexes.is_empty() {
+        if self.entry_handles.is_empty() {
             return 0;
         }
-        let first = self.entry_indexes[0].index;
+        let first = self.first_index;
         if index <= first {
             return 0;
         }
-        let count = std::cmp::min((index - first) as usize, self.entry_indexes.len());
-        self.entry_indexes.drain(..count);
-        self.maybe_shrink_entry_indexes();
+        let count = std::cmp::min((index - first) as usize, self.entry_handles.len());
+        self.first_index = index;
+        self.entry_handles.drain(..count);
+        if let Some(next) = self.entry_handles.front() {
+            if next.queue == LogQueue::Append {
+                self.entries_handles[LogQueue::Append as usize].pop_before(next.entries_addr);
+                self.entries_handles[LogQueue::Rewrite as usize].clear();
+            } else {
+                self.entries_handles[LogQueue::Rewrite as usize].pop_before(next.entries_addr);
+            }
+        } else {
+            self.entries_handles[LogQueue::Append as usize].clear();
+            self.entries_handles[LogQueue::Rewrite as usize].clear();
+        }
+        self.maybe_shrink_containers();
 
         let compacted_rewrite = std::cmp::min(count, self.rewrite_count);
         self.rewrite_count -= compacted_rewrite;
@@ -369,22 +612,30 @@ impl MemTable {
     /// Returns the number of deleted entries.
     fn unsafe_truncate_back(&mut self, first: u64, index: u64, last: u64) -> usize {
         debug_assert!(index <= last);
-        let len = self.entry_indexes.len();
+        let len = self.entry_handles.len();
         debug_assert_eq!(len as u64, last - first + 1);
-        self.entry_indexes
+        self.entry_handles
             .truncate(index.saturating_sub(first) as usize);
-        let new_len = self.entry_indexes.len();
+        let new_len = self.entry_handles.len();
         let truncated = len - new_len;
 
-        if self.rewrite_count > new_len {
+        if self.rewrite_count >= new_len {
+            // All append entries are truncated.
             let truncated_rewrite = self.rewrite_count - new_len;
             self.rewrite_count = new_len;
             self.global_stats
                 .delete(LogQueue::Rewrite, truncated_rewrite);
             self.global_stats
                 .delete(LogQueue::Append, truncated - truncated_rewrite);
+            self.entries_handles[LogQueue::Append as usize].clear();
         } else {
+            // No rewrite entry is truncated.
             self.global_stats.delete(LogQueue::Append, truncated);
+        }
+        if let Some(last) = self.entry_handles.back() {
+            self.entries_handles[last.queue as usize].pop_after(last.entries_addr);
+        } else {
+            self.entries_handles[LogQueue::Rewrite as usize].clear();
         }
         truncated
     }
@@ -416,25 +667,30 @@ impl MemTable {
                         self.region_id
                     );
                 }
+                self.first_index = first_index_to_add;
             } else if last + 1 < first_index_to_add {
                 if allow_hole {
                     self.unsafe_truncate_back(first, 0, last);
                 } else {
                     panic!("memtable {} has a hole", self.region_id);
                 }
+                self.first_index = first_index_to_add;
             } else if first_index_to_add != last + 1 {
                 self.unsafe_truncate_back(first, first_index_to_add, last);
             }
+        } else {
+            self.first_index = first_index_to_add;
         }
     }
 
     #[inline]
-    fn maybe_shrink_entry_indexes(&mut self) {
-        if self.entry_indexes.capacity() > SHRINK_CAPACITY_THRESHOLD
-            && self.entry_indexes.len() <= SHRINK_CAPACITY_TARGET
-        {
-            self.entry_indexes.shrink_to(SHRINK_CAPACITY_TARGET);
+    fn maybe_shrink_containers(&mut self) {
+        if self.entry_handles.capacity() >= ENTRY_CAPACITY_SHRINK_THRESHOLD {
+            self.entry_handles.shrink_to_fit();
         }
+        self.entries_handles[LogQueue::Append as usize].shrink(ENTRY_CAPACITY_SHRINK_THRESHOLD / 2);
+        self.entries_handles[LogQueue::Rewrite as usize]
+            .shrink(ENTRY_CAPACITY_SHRINK_THRESHOLD / 2);
     }
 
     /// Pulls all entries between log index `begin` and `end` to the given
@@ -452,36 +708,35 @@ impl MemTable {
         if end <= begin {
             return Ok(());
         }
-        let len = self.entry_indexes.len();
+        let len = self.entry_handles.len();
         if len == 0 {
             return Err(Error::EntryNotFound);
         }
-        let first = self.entry_indexes[0].index;
+        let first = self.first_index;
         if begin < first {
             return Err(Error::EntryCompacted);
         }
-        let last = self.entry_indexes[len - 1].index;
-        if end > last + 1 {
+        if end > self.first_index + len as u64 {
             return Err(Error::EntryNotFound);
         }
 
         let start_pos = (begin - first) as usize;
         let end_pos = (end - begin) as usize + start_pos;
 
-        let (first, second) = slices_in_range(&self.entry_indexes, start_pos, end_pos);
-        if let Some(max_size) = max_size {
-            let mut total_size = 0;
-            for idx in first.iter().chain(second) {
-                total_size += idx.entry_len;
-                // No matter max_size's value, fetch one entry at least.
-                if total_size as usize > max_size && total_size > idx.entry_len {
+        let (first, second) = slices_in_range(&self.entry_handles, start_pos, end_pos);
+        let mut total_size = 0;
+        let mut index = begin;
+        for entry in first.iter().chain(second) {
+            total_size += entry.len;
+            // No matter max_size's value, fetch one entry at least.
+            if let Some(max_size) = max_size {
+                if total_size as usize > max_size && total_size > entry.len {
                     break;
                 }
-                vec_idx.push(*idx);
             }
-        } else {
-            vec_idx.extend_from_slice(first);
-            vec_idx.extend_from_slice(second);
+            let entries_handle = self.get_entries_handle(entry);
+            vec_idx.push(EntryIndex::new_with(index, entries_handle, entry));
+            index += 1;
         }
         Ok(())
     }
@@ -493,18 +748,21 @@ impl MemTable {
         gate: FileSeq,
         vec_idx: &mut Vec<EntryIndex>,
     ) -> Result<()> {
-        let begin = self
-            .entry_indexes
-            .iter()
-            .find(|e| e.entries.unwrap().id.queue == LogQueue::Append);
-        let end = self
-            .entry_indexes
-            .iter()
-            .rev()
-            .find(|e| e.entries.unwrap().id.seq <= gate);
-        if let (Some(begin), Some(end)) = (begin, end) {
-            if begin.index <= end.index {
-                return self.fetch_entries_to(begin.index, end.index + 1, None, vec_idx);
+        if let Some((first, last)) = self.span() {
+            let mut i = self.rewrite_count;
+            while first + i as u64 <= last {
+                let entry = &self.entry_handles[i];
+                let entries_handle = self.get_entries_handle(entry);
+                if entries_handle.block.id.seq <= gate {
+                    vec_idx.push(EntryIndex::new_with(
+                        first + i as u64,
+                        entries_handle,
+                        entry,
+                    ));
+                    i += 1;
+                } else {
+                    break;
+                }
             }
         }
         Ok(())
@@ -513,8 +771,8 @@ impl MemTable {
     /// Pulls all rewrite entries to the provided buffer.
     pub fn fetch_rewritten_entry_indexes(&self, vec_idx: &mut Vec<EntryIndex>) -> Result<()> {
         if self.rewrite_count > 0 {
-            let first = self.entry_indexes[0].index;
-            let end = self.entry_indexes[self.rewrite_count - 1].index + 1;
+            let first = self.first_index;
+            let end = self.first_index + self.rewrite_count as u64;
             self.fetch_entries_to(first, end, None, vec_idx)
         } else {
             Ok(())
@@ -544,11 +802,11 @@ impl MemTable {
     /// in this table.
     pub fn min_file_seq(&self, queue: LogQueue) -> Option<FileSeq> {
         let entry = match queue {
-            LogQueue::Append => self.entry_indexes.get(self.rewrite_count),
+            LogQueue::Append => self.entry_handles.get(self.rewrite_count),
             LogQueue::Rewrite if self.rewrite_count == 0 => None,
-            LogQueue::Rewrite => self.entry_indexes.front(),
+            LogQueue::Rewrite => self.entry_handles.front(),
         };
-        let ents_min = entry.map(|e| e.entries.unwrap().id.seq);
+        let ents_min = entry.map(|e| self.get_entries_handle(e).block.id.seq);
         let kvs_min = self
             .kvs
             .values()
@@ -572,8 +830,8 @@ impl MemTable {
     pub fn entries_count_before(&self, mut gate: FileId) -> usize {
         gate.seq += 1;
         let idx = self
-            .entry_indexes
-            .binary_search_by_key(&gate, |ei| ei.entries.unwrap().id);
+            .entry_handles
+            .binary_search_by_key(&gate, |ei| self.get_entries_handle(ei).block.id);
         match idx {
             Ok(idx) => idx,
             Err(idx) => idx,
@@ -591,12 +849,12 @@ impl MemTable {
 
     /// Returns the log index of the first log entry.
     pub fn first_index(&self) -> Option<u64> {
-        self.entry_indexes.front().map(|e| e.index)
+        self.span().map(|s| s.0)
     }
 
     /// Returns the log index of the last log entry.
     pub fn last_index(&self) -> Option<u64> {
-        self.entry_indexes.back().map(|e| e.index)
+        self.span().map(|s| s.1)
     }
 
     fn heap_size(&self) -> usize {
@@ -607,40 +865,66 @@ impl MemTable {
     /// Returns the first and last log index of the entries in this table.
     #[inline]
     fn span(&self) -> Option<(u64, u64)> {
-        let len = self.entry_indexes.len();
+        let len = self.entry_handles.len();
         if len > 0 {
-            Some((
-                self.entry_indexes[0].index,
-                self.entry_indexes[len - 1].index,
-            ))
+            Some((self.first_index, self.first_index + len as u64 - 1))
         } else {
             None
         }
     }
 
+    #[inline]
+    fn get_entries_handle(&self, entry_handle: &EntryHandle) -> &EntriesHandle {
+        self.entries_handles[entry_handle.queue as usize].at(entry_handle.entries_addr)
+    }
+
     #[cfg(test)]
     fn consistency_check(&self) {
         let mut seen_append = false;
-        let mut last_index = None;
-        for idx in self.entry_indexes.iter() {
-            // Check 1: indexes are contiguous.
-            if let Some(last_index) = last_index {
-                assert_eq!(idx.index, last_index + 1);
-            }
-            last_index = Some(idx.index);
-            // Check 2: rewrites are at the front.
-            let queue = idx.entries.unwrap().id.queue;
-            if queue == LogQueue::Append {
+        for idx in self.entry_handles.iter() {
+            // Entry handles are consistent with entries handles.
+            assert_eq!(self.get_entries_handle(idx).block.id.queue, idx.queue);
+            // Rewrites are at the front.
+            if idx.queue == LogQueue::Append {
                 seen_append = true;
             }
             assert_eq!(
-                queue,
+                idx.queue,
                 if seen_append {
                     LogQueue::Append
                 } else {
                     LogQueue::Rewrite
                 }
             );
+            // No dangling entries handle.
+            let mut last_addr = None;
+            let entries = &self.entries_handles[LogQueue::Rewrite as usize];
+            for e in self.entry_handles.iter().take(self.rewrite_count) {
+                if let Some(last) = &mut last_addr {
+                    assert!(e.entries_addr == *last || e.entries_addr == *last + 1);
+                    *last = e.entries_addr;
+                } else {
+                    last_addr = Some(e.entries_addr);
+                    assert_eq!(e.entries_addr, entries.start_addr);
+                }
+            }
+            if let Some(last) = last_addr {
+                assert_eq!(entries.start_addr + entries.inner.len(), last + 1)
+            }
+            last_addr = None;
+            let entries = &self.entries_handles[LogQueue::Append as usize];
+            for e in self.entry_handles.iter().skip(self.rewrite_count) {
+                if let Some(last) = &mut last_addr {
+                    assert!(e.entries_addr == *last || e.entries_addr == *last + 1);
+                    *last = e.entries_addr;
+                } else {
+                    last_addr = Some(e.entries_addr);
+                    assert_eq!(e.entries_addr, entries.start_addr);
+                }
+            }
+            if let Some(last) = last_addr {
+                assert_eq!(entries.start_addr + entries.inner.len(), last + 1)
+            }
         }
     }
 }
@@ -660,7 +944,7 @@ impl Drop for MemTable {
             .delete(LogQueue::Rewrite, self.rewrite_count + rewrite_kvs);
         self.global_stats.delete(
             LogQueue::Append,
-            self.entry_indexes.len() - self.rewrite_count + append_kvs,
+            self.entry_handles.len() - self.rewrite_count + append_kvs,
         );
     }
 }
@@ -1001,12 +1285,12 @@ mod tests {
     impl MemTable {
         pub fn max_file_seq(&self, queue: LogQueue) -> Option<FileSeq> {
             let entry = match queue {
-                LogQueue::Append if self.rewrite_count == self.entry_indexes.len() => None,
-                LogQueue::Append => self.entry_indexes.back(),
+                LogQueue::Append if self.rewrite_count == self.entry_handles.len() => None,
+                LogQueue::Append => self.entry_handles.back(),
                 LogQueue::Rewrite if self.rewrite_count == 0 => None,
-                LogQueue::Rewrite => self.entry_indexes.get(self.rewrite_count - 1),
+                LogQueue::Rewrite => self.entry_handles.get(self.rewrite_count - 1),
             };
-            let ents_max = entry.map(|e| e.entries.unwrap().id.seq);
+            let ents_max = entry.map(|e| self.get_entries_handle(e).block.id.seq);
 
             let kvs_max = self.kvs_max_file_seq(queue);
             match (ents_max, kvs_max) {
@@ -1030,20 +1314,17 @@ mod tests {
                 })
         }
 
-        pub fn fetch_all(&self, vec_idx: &mut Vec<EntryIndex>) {
-            if self.entry_indexes.is_empty() {
-                return;
+        pub fn fetch_all(&self) -> Vec<EntryIndex> {
+            let mut v = Vec::new();
+            if let Some((first, last)) = self.span() {
+                self.fetch_entries_to(first, last + 1, None, &mut v)
+                    .unwrap();
             }
-
-            let begin = self.entry_indexes.front().unwrap().index;
-            let end = self.entry_indexes.back().unwrap().index + 1;
-            self.fetch_entries_to(begin, end, None, vec_idx).unwrap();
+            v
         }
 
         fn entries_size(&self) -> usize {
-            self.entry_indexes
-                .iter()
-                .fold(0, |acc, e| acc + e.entry_len) as usize
+            self.entry_handles.iter().fold(0, |acc, e| acc + e.len) as usize
         }
     }
 
@@ -1231,10 +1512,8 @@ mod tests {
         let region_id = 8;
         let mut memtable = MemTable::new(region_id, Arc::new(GlobalStats::default()));
 
-        let mut ents_idx = vec![];
-
         // Fetch empty.
-        memtable.fetch_all(&mut ents_idx);
+        let mut ents_idx = memtable.fetch_all();
         assert!(ents_idx.is_empty());
         memtable
             .fetch_entries_to(0, 0, None, &mut ents_idx)
@@ -1268,7 +1547,7 @@ mod tests {
         ));
 
         // Fetching all
-        memtable.fetch_all(&mut ents_idx);
+        let mut ents_idx = memtable.fetch_all();
         assert_eq!(ents_idx.len(), 25);
         assert_eq!(ents_idx[0].index, 0);
         assert_eq!(ents_idx[24].index, 24);
@@ -1882,19 +2161,19 @@ mod tests {
             let mut rewrite = case(empty_table(region_id), Some(LogQueue::Rewrite));
             rewrite.merge_append_table(&mut append);
             assert_eq!(
-                rewrite.entry_indexes,
-                case(empty_table(region_id), Some(LogQueue::Rewrite)).entry_indexes,
+                rewrite.fetch_all(),
+                case(empty_table(region_id), Some(LogQueue::Rewrite)).fetch_all(),
             );
-            assert!(append.entry_indexes.is_empty());
+            assert!(append.fetch_all().is_empty());
 
             let mut append = case(empty_table(region_id), Some(LogQueue::Append));
             let mut rewrite = empty_table(region_id);
             rewrite.merge_append_table(&mut append);
             assert_eq!(
-                rewrite.entry_indexes,
-                case(empty_table(region_id), Some(LogQueue::Append)).entry_indexes
+                rewrite.fetch_all(),
+                case(empty_table(region_id), Some(LogQueue::Append)).fetch_all()
             );
-            assert!(append.entry_indexes.is_empty());
+            assert!(append.fetch_all().is_empty());
         }
 
         for (i, case) in cases.iter().enumerate() {
@@ -1911,8 +2190,8 @@ mod tests {
                 rewrite.global_stats.live_entries(LogQueue::Rewrite),
                 expected.global_stats.live_entries(LogQueue::Rewrite)
             );
-            assert_eq!(rewrite.entry_indexes, expected.entry_indexes);
-            assert!(append.entry_indexes.is_empty());
+            assert_eq!(rewrite.fetch_all(), expected.fetch_all());
+            assert!(append.fetch_all().is_empty());
         }
     }
 
