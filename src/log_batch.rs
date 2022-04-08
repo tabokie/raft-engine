@@ -808,9 +808,9 @@ impl LogBatch {
     ///
     /// The information includes:
     ///
-    /// + The offset of log items
-    /// + The compression type of entries
-    /// + The total length of this log batch.
+    /// - The offset of log items.
+    /// - The compression type of entries.
+    /// - The total length of this log batch.
     pub(crate) fn decode_header(buf: &mut SliceReader) -> Result<(usize, CompressionType, usize)> {
         if buf.len() < LOG_BATCH_HEADER_LEN {
             return Err(Error::Corruption(format!(
@@ -853,6 +853,19 @@ impl LogBatch {
         } else {
             Ok(Vec::new())
         }
+    }
+
+    /// Extract one entry from a decoded block of multiple entries.
+    pub(crate) fn decode_entry_block<'a>(
+        buf: &'a mut SliceReader,
+        number: u32,
+    ) -> Result<&'a [u8]> {
+        let mut offset = 0;
+        for i in 1..number {
+            offset += codec::decode_u64(buf)? as usize;
+        }
+        let len = codec::decode_u64(buf)? as usize;
+        Ok(&buf[offset..offset + len])
     }
 }
 

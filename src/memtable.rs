@@ -34,11 +34,6 @@ pub struct EntryIndex {
     pub entries: Option<FileBlockHandle>,
     // How its group of entries is compacted.
     pub compression_type: CompressionType,
-
-    /// The relative offset within its group of entries.
-    pub entry_offset: u32,
-    /// The encoded length within its group of entries.
-    pub entry_len: u32,
 }
 
 impl Default for EntryIndex {
@@ -47,8 +42,6 @@ impl Default for EntryIndex {
             index: 0,
             entries: None,
             compression_type: CompressionType::None,
-            entry_offset: 0,
-            entry_len: 0,
         }
     }
 }
@@ -59,8 +52,6 @@ impl EntryIndex {
             index,
             entries: e.entries,
             compression_type: e.compression_type,
-            entry_offset: e.entry_offset,
-            entry_len: e.entry_len,
         }
     }
 }
@@ -69,8 +60,6 @@ impl EntryIndex {
 struct ThinEntryIndex {
     entries: Option<FileBlockHandle>,
     compression_type: CompressionType,
-    entry_offset: u32,
-    entry_len: u32,
 }
 
 impl From<&EntryIndex> for ThinEntryIndex {
@@ -78,8 +67,6 @@ impl From<&EntryIndex> for ThinEntryIndex {
         Self {
             entries: e.entries,
             compression_type: e.compression_type,
-            entry_offset: e.entry_offset,
-            entry_len: e.entry_len,
         }
     }
 }
