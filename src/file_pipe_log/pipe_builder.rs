@@ -16,7 +16,7 @@ use crate::config::{Config, RecoveryMode};
 use crate::env::FileSystem;
 use crate::event_listener::EventListener;
 use crate::log_batch::LogItemBatch;
-use crate::pipe_log::{FileId, FileSeq, LogQueue};
+use crate::pipe_log::{FileId, FileSeq, LogKind, LogQueue};
 use crate::util::Factory;
 use crate::{Error, Result};
 
@@ -120,19 +120,21 @@ impl<F: FileSystem> DualPipesBuilder<F> {
                 if p.is_file() {
                     match FileId::parse_file_name(p.file_name().unwrap().to_str().unwrap()) {
                         Some(FileId {
-                            queue: LogQueue::Append,
+                            queue: LogQueue::DEFAULT,
                             seq,
                         }) => {
                             min_append_id = std::cmp::min(min_append_id, seq);
                             max_append_id = std::cmp::max(max_append_id, seq);
                         }
                         Some(FileId {
-                            queue: LogQueue::Rewrite,
+                            queue: LogQueue::REWRITE,
                             seq,
                         }) => {
                             min_rewrite_id = std::cmp::min(min_rewrite_id, seq);
                             max_rewrite_id = std::cmp::max(max_rewrite_id, seq);
                         }
+                        // Queue other than default is not supported yet.
+                        Some(_) => unreachable!(),
                         _ => {}
                     }
                 }
@@ -141,13 +143,13 @@ impl<F: FileSystem> DualPipesBuilder<F> {
 
         for (queue, min_id, max_id, files) in [
             (
-                LogQueue::Append,
+                LogQueue::DEFAULT,
                 min_append_id,
                 max_append_id,
                 &mut self.append_files,
             ),
             (
-                LogQueue::Rewrite,
+                LogQueue::REWRITE,
                 min_rewrite_id,
                 max_rewrite_id,
                 &mut self.rewrite_files,
@@ -229,13 +231,13 @@ impl<F: FileSystem> DualPipesBuilder<F> {
                 _ => (threads, threads),
             };
         let append_recovery_cfg = RecoveryConfig {
-            queue: LogQueue::Append,
+            queue: LogQueue::DEFAULT,
             mode: self.cfg.recovery_mode,
             concurrency: append_concurrency,
             read_block_size: self.cfg.recovery_read_block_size.0,
         };
         let rewrite_recovery_cfg = RecoveryConfig {
-            queue: LogQueue::Rewrite,
+            queue: LogQueue::REWRITE,
             concurrency: rewrite_concurrency,
             ..append_recovery_cfg
         };
@@ -383,7 +385,7 @@ impl<F: FileSystem> DualPipesBuilder<F> {
         recovery_cfg: RecoveryConfig,
         replay_machine_factory: &FA,
     ) -> Result<M> {
-        let files = if recovery_cfg.queue == LogQueue::Append {
+        let files = if recovery_cfg.queue == LogQueue::DEFAULT {
             &mut self.append_files
         } else {
             &mut self.rewrite_files
@@ -399,8 +401,9 @@ impl<F: FileSystem> DualPipesBuilder<F> {
     /// Builds a new storage for the specified log queue.
     fn build_pipe(&self, queue: LogQueue) -> Result<SinglePipe<F>> {
         let files = match queue {
-            LogQueue::Append => &self.append_files,
-            LogQueue::Rewrite => &self.rewrite_files,
+            LogQueue::DEFAULT => &self.append_files,
+            LogQueue::REWRITE => &self.rewrite_files,
+            _ => unreachable!(),
         };
         let first_seq = files.first().map(|f| f.seq).unwrap_or(0);
         let files: VecDeque<FileWithFormat<F>> = files
@@ -417,17 +420,17 @@ impl<F: FileSystem> DualPipesBuilder<F> {
             queue,
             first_seq,
             files,
-            match queue {
-                LogQueue::Append => self.cfg.recycle_capacity(),
-                LogQueue::Rewrite => 0,
+            match queue.kind() {
+                LogKind::Append => self.cfg.recycle_capacity(),
+                LogKind::Rewrite => 0,
             },
         )
     }
 
     /// Builds a [`DualPipes`] that contains all available log files.
     pub fn finish(self) -> Result<DualPipes<F>> {
-        let appender = self.build_pipe(LogQueue::Append)?;
-        let rewriter = self.build_pipe(LogQueue::Rewrite)?;
+        let appender = self.build_pipe(LogQueue::DEFAULT)?;
+        let rewriter = self.build_pipe(LogQueue::REWRITE)?;
         DualPipes::open(self.dir_lock.unwrap(), appender, rewriter)
     }
 }

@@ -2,7 +2,6 @@
 
 //! A generic log storage.
 
-use std::cmp::Ordering;
 use std::fmt::{self, Display};
 
 use fail::fail_point;
@@ -13,12 +12,37 @@ use strum::EnumIter;
 
 use crate::Result;
 
+/// Making it possible to use fixed-size array to store channel info.
+pub const MAX_WRITE_CHANNELS: usize = 8;
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum LogKind {
+    Rewrite = 0,
+    Append = 1,
+}
+
 /// The type of log queue.
-#[repr(u8)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub enum LogQueue {
-    Append = 0,
-    Rewrite = 1,
+pub struct LogQueue(u8);
+
+impl LogQueue {
+    pub const REWRITE: LogQueue = LogQueue(0);
+    pub const DEFAULT: LogQueue = LogQueue(1);
+
+    #[inline]
+    pub fn i(&self) -> u8 {
+        debug_assert!(self.0 as usize <= MAX_WRITE_CHANNELS);
+        self.0
+    }
+
+    #[inline]
+    pub fn kind(&self) -> LogKind {
+        if *self == Self::REWRITE {
+            LogKind::Rewrite
+        } else {
+            LogKind::Append
+        }
+    }
 }
 
 /// Sequence number for log file. It is unique within a log queue.
@@ -44,20 +68,84 @@ impl FileId {
     }
 }
 
-/// Order by freshness.
-impl std::cmp::Ord for FileId {
-    fn cmp(&self, other: &Self) -> Ordering {
-        match (self.queue, other.queue) {
-            (LogQueue::Append, LogQueue::Rewrite) => Ordering::Greater,
-            (LogQueue::Rewrite, LogQueue::Append) => Ordering::Less,
-            _ => self.seq.cmp(&other.seq),
+/// A view of files in Append queue. Files in Rewrite queue are not included.
+/// Internally it contains a list of latest file IDs of all write channels.
+/// `None` means the channel doesn't exist when the view is created.
+#[derive(Debug, Clone)]
+pub struct FilesView([Option<FileSeq>; MAX_WRITE_CHANNELS]);
+
+impl FilesView {
+    /// Returns whether the file `id` is visible to the files view.
+    #[inline]
+    pub fn contains(&self, id: &FileId) -> bool {
+        if id.queue != LogQueue::REWRITE {
+            if let Some(seq) = self.0[id.queue.i() as usize - 1] {
+                return id.seq <= seq;
+            }
+        }
+        false
+    }
+
+    /// A simple view that contains default channel files with seqno no larger
+    /// than `seq`.
+    #[inline]
+    pub fn simple_view(seq: u64) -> Self {
+        let mut view = Self::empty_view();
+        view.0[LogQueue::DEFAULT.i() as usize - 1] = Some(seq);
+        view
+    }
+
+    #[inline]
+    pub fn empty_view() -> Self {
+        FilesView(Default::default())
+    }
+
+    /// Often used in combo with `empty_view` to calculate the upper bound of
+    /// some files.
+    #[inline]
+    pub fn update_to_contain(&mut self, id: &FileId) {
+        if !self.contains(id) {
+            debug_assert!(id.queue != LogQueue::REWRITE);
+            self.0[id.queue.i() as usize - 1] = Some(id.seq);
         }
     }
-}
 
-impl std::cmp::PartialOrd for FileId {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
+    #[inline]
+    pub fn full_view() -> Self {
+        let mut view = Self::empty_view();
+        for i in view.0.iter_mut() {
+            *i = Some(u64::MAX);
+        }
+        view
+    }
+
+    /// Often used in combo with `full_view` to calculate the lower bound of
+    /// some files.
+    #[inline]
+    pub fn update_to_exclude(&mut self, id: &FileId) {
+        // Cannot exclude rewrite.
+        assert!(id.queue != LogQueue::REWRITE);
+        if self.contains(id) {
+            self.0[id.queue.i() as usize - 1] = if id.seq == 0 { None } else { Some(id.seq - 1) };
+        }
+    }
+
+    #[inline]
+    pub fn intersect(&mut self, rhs: &FilesView) {
+        for i in 0..MAX_WRITE_CHANNELS {
+            if self.contains(&FileId::new(LogQueue(i as u8 + 1), rhs.0[i].unwrap_or(0))) {
+                self.0[i] = rhs.0[i];
+            }
+        }
+    }
+
+    #[inline]
+    pub fn distilled(&self) -> Vec<FileId> {
+        self.0
+            .iter()
+            .enumerate()
+            .filter_map(|(ch, seq)| seq.map(|seq| FileId::new(LogQueue(ch as u8 + 1), seq)))
+            .collect()
     }
 }
 
@@ -168,26 +256,27 @@ pub trait PipeLog: Sized {
     /// of the specified log queue.
     fn file_span(&self, queue: LogQueue) -> (FileSeq, FileSeq);
 
-    /// Returns the oldest file ID that is newer than `position`% of all files.
-    fn file_at(&self, queue: LogQueue, mut position: f64) -> FileSeq {
-        if position > 1.0 {
-            position = 1.0;
-        } else if position < 0.0 {
-            position = 0.0;
-        }
-        let (first, active) = self.file_span(queue);
-        let count = active - first + 1;
-        first + (count as f64 * position) as u64
+    /// Returns an approximate view of the pipe when the total size of
+    /// Append queues is only `portion`% of current size. The view is
+    /// approximate because being visible in it is only necessary (but not
+    /// sufficient) to fit the requirement. The view must only contain immutable
+    /// files. Returns `None` if there is no file in Append queue matching
+    /// the requirement.
+    fn history_files_view(&self, portion: f64) -> Option<FilesView>;
+
+    fn latest_files_view(&self) -> FilesView {
+        FilesView::simple_view(self.file_span(LogQueue::DEFAULT).1)
     }
 
-    /// Returns total size of the specified log queue.
-    fn total_size(&self, queue: LogQueue) -> usize;
+    /// Returns total size of the specified kind of log queues.
+    fn total_size(&self, kind: LogKind) -> usize;
 
-    /// Rotates a new log file for the specified log queue.
+    /// Rotates a new log file for the specified log queue. Returns the newly
+    /// created file ID.
     ///
     /// Implementation should be atomic under error conditions but not
     /// necessarily panic-safe.
-    fn rotate(&self, queue: LogQueue) -> Result<()>;
+    fn rotate(&self, queue: LogQueue) -> Result<FileId>;
 
     /// Deletes all log files up to the specified file ID. The scope is limited
     /// to the log queue of `file_id`.
