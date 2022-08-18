@@ -22,7 +22,7 @@ use crate::{Error, Result};
 
 use super::format::{lock_file_path, FileNameExt, LogFileFormat};
 use super::log_file::build_file_reader;
-use super::pipe::{DualPipes, FileWithFormat, SinglePipe};
+use super::pipe::{SomePipes, FileWithFormat, SinglePipe};
 use super::reader::LogItemBatchFileReader;
 use crate::env::Handle;
 
@@ -69,21 +69,21 @@ struct FileToRecover<F: FileSystem> {
     format: Option<LogFileFormat>,
 }
 
-/// [`DualPipes`] factory that can also recover other customized memory states.
-pub struct DualPipesBuilder<F: FileSystem> {
+/// [`SomePipes`] factory that can also recover other customized memory states.
+pub struct SomePipesBuilder<F: FileSystem> {
     cfg: Config,
     file_system: Arc<F>,
     listeners: Vec<Arc<dyn EventListener>>,
 
-    /// Only filled after a successful call of `DualPipesBuilder::scan`.
+    /// Only filled after a successful call of `SomePipesBuilder::scan`.
     dir_lock: Option<File>,
-    /// Only filled after a successful call of `DualPipesBuilder::scan`.
+    /// Only filled after a successful call of `SomePipesBuilder::scan`.
     append_files: Vec<FileToRecover<F>>,
-    /// Only filled after a successful call of `DualPipesBuilder::scan`.
+    /// Only filled after a successful call of `SomePipesBuilder::scan`.
     rewrite_files: Vec<FileToRecover<F>>,
 }
 
-impl<F: FileSystem> DualPipesBuilder<F> {
+impl<F: FileSystem> SomePipesBuilder<F> {
     /// Creates a new builder.
     pub fn new(cfg: Config, file_system: Arc<F>, listeners: Vec<Arc<dyn EventListener>>) -> Self {
         Self {
@@ -250,7 +250,7 @@ impl<F: FileSystem> DualPipesBuilder<F> {
         // with ThreadPool.
         let (append, rewrite) = pool.join(
             || {
-                DualPipesBuilder::recover_queue_imp(
+                SomePipesBuilder::recover_queue_imp(
                     file_system.clone(),
                     append_recovery_cfg,
                     append_files,
@@ -258,7 +258,7 @@ impl<F: FileSystem> DualPipesBuilder<F> {
                 )
             },
             || {
-                DualPipesBuilder::recover_queue_imp(
+                SomePipesBuilder::recover_queue_imp(
                     file_system.clone(),
                     rewrite_recovery_cfg,
                     rewrite_files,
@@ -390,7 +390,7 @@ impl<F: FileSystem> DualPipesBuilder<F> {
         } else {
             &mut self.rewrite_files
         };
-        DualPipesBuilder::recover_queue_imp(
+        SomePipesBuilder::recover_queue_imp(
             file_system,
             recovery_cfg,
             files,
@@ -420,18 +420,14 @@ impl<F: FileSystem> DualPipesBuilder<F> {
             queue,
             first_seq,
             files,
-            match queue.kind() {
-                LogKind::Append => self.cfg.recycle_capacity(),
-                LogKind::Rewrite => 0,
-            },
         )
     }
 
-    /// Builds a [`DualPipes`] that contains all available log files.
-    pub fn finish(self) -> Result<DualPipes<F>> {
+    /// Builds a [`SomePipes`] that contains all available log files.
+    pub fn finish(self) -> Result<SomePipes<F>> {
         let appender = self.build_pipe(LogQueue::DEFAULT)?;
         let rewriter = self.build_pipe(LogQueue::REWRITE)?;
-        DualPipes::open(self.dir_lock.unwrap(), appender, rewriter)
+        SomePipes::open(self.dir_lock.unwrap(), appender, rewriter)
     }
 }
 

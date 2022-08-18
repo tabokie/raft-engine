@@ -90,7 +90,7 @@ pub(super) struct SinglePipe<F: FileSystem> {
     ///
     /// `active_file` must be locked first to acquire both `files` and
     /// `active_file`
-    active_file: CachePadded<Mutex<ActiveFile<F>>>,
+    active_file: CachePadded<Mutex<Option<ActiveFile<F>>>>,
 }
 
 impl<F: FileSystem> Drop for SinglePipe<F> {
@@ -120,16 +120,14 @@ impl<F: FileSystem> Drop for SinglePipe<F> {
 }
 
 impl<F: FileSystem> SinglePipe<F> {
-    /// Opens a new [`SinglePipe`].
-    pub fn open(
+    /// Creates an empty [`SinglePipe`].
+    pub fn new(
         cfg: &Config,
         file_system: Arc<F>,
         listeners: Vec<Arc<dyn EventListener>>,
         queue: LogQueue,
-        mut first_seq: FileSeq,
-        mut fds: VecDeque<FileWithFormat<F>>,
         capacity: usize,
-    ) -> Result<Self> {
+    ) -> Self {
         #[allow(unused_mut)]
         let mut alignment = 0;
         #[cfg(feature = "failpoints")]
@@ -144,45 +142,7 @@ impl<F: FileSystem> SinglePipe<F> {
                 alignment = 16;
             }
         }
-
-        let create_file = first_seq == 0;
-        let active_seq = if create_file {
-            first_seq = 1;
-            let file_id = FileId {
-                queue,
-                seq: first_seq,
-            };
-            let fd = Arc::new(file_system.create(&file_id.build_file_path(&cfg.dir))?);
-            fds.push_back(FileWithFormat {
-                handle: fd,
-                format: LogFileFormat::new(cfg.format_version, alignment),
-            });
-            first_seq
-        } else {
-            first_seq + fds.len() as u64 - 1
-        };
-
-        for seq in first_seq..=active_seq {
-            for listener in &listeners {
-                listener.post_new_log_file(FileId { queue, seq });
-            }
-        }
-        let active_fd = fds.back().unwrap();
-        let active_file = ActiveFile {
-            seq: active_seq,
-            // Here, we should keep the LogFileFormat conincident with the original one, written by
-            // the previous `Pipe`.
-            writer: build_file_writer(
-                file_system.as_ref(),
-                active_fd.handle.clone(),
-                active_fd.format,
-                false, /* force_reset */
-            )?,
-            format: active_fd.format,
-        };
-
-        let total_files = fds.len();
-        let pipe = Self {
+        Self {
             queue,
             dir: cfg.dir.clone(),
             file_format: LogFileFormat::new(cfg.format_version, alignment),
@@ -192,15 +152,51 @@ impl<F: FileSystem> SinglePipe<F> {
             listeners,
 
             files: CachePadded::new(RwLock::new(FileCollection {
-                first_seq,
-                first_seq_in_use: first_seq,
-                fds,
-                capacity,
+                first_seq: 0,
+                first_seq_in_use: 0,
+                fds: VecDeque::new(),
+                match queue.kind() {
+                    LogKind::Append => cfg.recycle_capacity(),
+                    LogKind::Rewrite => 0,
+                },
             })),
-            active_file: CachePadded::new(Mutex::new(active_file)),
+            active_file: CachePadded::new(Mutex::new(None)),
+        }
+    }
+
+    fn prepare_for_write(&mut self) {
+
+    }
+
+    /// Initializes the pipe with some existing files.
+    pub fn initialize(
+        &mut self,
+        mut first_seq: FileSeq,
+        mut fds: VecDeque<FileWithFormat<F>>,
+    ) -> Result<()> {
+        assert!(self.files.is_empty());
+        assert!(self.active_file.lock().is_none());
+        assert!(!fds.is_empty());
+        let active_seq = first_seq + fds.len() as u64 - 1;
+        for seq in first_seq..=active_seq {
+            for listener in &listeners {
+                listener.post_new_log_file(FileId { self.queue, seq });
+            }
+        }
+        let active_fd = fds.back().unwrap();
+        let active_file = ActiveFile {
+            seq: active_seq,
+            writer: build_file_writer(
+                file_system.as_ref(),
+                active_fd.handle.clone(),
+                active_fd.format,
+                false, /* force_reset */
+            )?,
+            format: active_fd.format,
         };
-        pipe.flush_metrics(total_files);
-        Ok(pipe)
+        self.files.write().first_seq = first_seq;
+        pipe.flush_metrics(fds.len());
+        Ok(())
     }
 
     /// Synchronizes all metadatas associated with the working directory to the
@@ -464,14 +460,14 @@ impl<F: FileSystem> SinglePipe<F> {
 }
 
 /// A [`PipeLog`] implementation that stores data in filesystem.
-pub struct DualPipes<F: FileSystem> {
-    pipes: [SinglePipe<F>; 2],
+pub struct SomePipes<F: FileSystem> {
+    pipes: [SinglePipe<F>; MAX_WRITE_CHANNELS],
 
     _dir_lock: File,
 }
 
-impl<F: FileSystem> DualPipes<F> {
-    /// Open a new [`DualPipes`]. Assumes the two [`SinglePipe`]s share the
+impl<F: FileSystem> SomePipes<F> {
+    /// Open a new [`SomePipes`]. Assumes the two [`SinglePipe`]s share the
     /// same directory, and that directory is locked by `dir_lock`.
     pub(super) fn open(
         dir_lock: File,
@@ -494,7 +490,7 @@ impl<F: FileSystem> DualPipes<F> {
     }
 }
 
-impl<F: FileSystem> PipeLog for DualPipes<F> {
+impl<F: FileSystem> PipeLog for SomePipes<F> {
     #[inline]
     fn read_bytes(&self, handle: FileBlockHandle) -> Result<Vec<u8>> {
         self.pipes[handle.id.queue.i() as usize].read_bytes(handle)
@@ -573,15 +569,11 @@ mod tests {
             queue,
             0,
             VecDeque::new(),
-            match queue.kind() {
-                LogKind::Append => cfg.recycle_capacity(),
-                LogKind::Rewrite => 0,
-            },
         )
     }
 
-    fn new_test_pipes(cfg: &Config) -> Result<DualPipes<DefaultFileSystem>> {
-        DualPipes::open(
+    fn new_test_pipes(cfg: &Config) -> Result<SomePipes<DefaultFileSystem>> {
+        SomePipes::open(
             lock_dir(&cfg.dir)?,
             new_test_pipe(cfg, LogQueue::DEFAULT)?,
             new_test_pipe(cfg, LogQueue::REWRITE)?,

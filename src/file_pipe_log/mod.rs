@@ -11,9 +11,9 @@ mod pipe_builder;
 mod reader;
 
 pub use format::FileNameExt;
-pub use pipe::DualPipes as FilePipeLog;
+pub use pipe::SomePipes as FilePipeLog;
 pub use pipe_builder::{
-    DefaultMachineFactory, DualPipesBuilder as FilePipeLogBuilder, RecoveryConfig, ReplayMachine,
+    DefaultMachineFactory, SomePipesBuilder as FilePipeLogBuilder, RecoveryConfig, ReplayMachine,
 };
 
 pub mod debug {
