@@ -184,6 +184,26 @@ impl Handle for LogFd {
             nix::unistd::fsync(self.0).map_err(|e| from_nix_error(e, "fsync"))
         }
     }
+
+    #[inline]
+    #[allow(unused_variables)]
+    fn sync_range(&self, offset: usize, size: usize) -> IoResult<()> {
+        #[cfg(all(target_os = "linux", not(feature = "failpoints")))]
+        unsafe {
+            let code = libc::sync_file_range(
+                self.0,
+                offset as i64,
+                size as i64,
+                libc::SYNC_FILE_RANGE_WAIT_BEFORE
+                    | libc::SYNC_FILE_RANGE_WRITE
+                    | libc::SYNC_FILE_RANGE_WAIT_AFTER,
+            );
+            if code == 0 {
+                return Ok(());
+            }
+        }
+        self.sync()
+    }
 }
 
 impl Drop for LogFd {

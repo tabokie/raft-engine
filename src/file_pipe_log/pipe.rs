@@ -26,6 +26,7 @@ use super::log_file::{build_file_reader, build_file_writer, LogFileWriter};
 pub struct FileWithFormat<F: FileSystem> {
     pub handle: Arc<F::Handle>,
     pub format: LogFileFormat,
+    pub used_size: usize,
 }
 
 struct FileCollection<F: FileSystem> {
@@ -195,6 +196,7 @@ impl<F: FileSystem> SinglePipe<F> {
             fds.push_back(FileWithFormat {
                 handle: fd,
                 format: LogFileFormat::new(cfg.format_version, alignment),
+                used_size: 0,
             });
             first_seq
         } else {
@@ -317,9 +319,11 @@ impl<F: FileSystem> SinglePipe<F> {
         let alignment = new_file.format.alignment;
         **active_file = new_file;
 
+        let used_size = fd.file_size()?;
         let state = self.files.write().push(FileWithFormat {
             handle: fd,
             format: LogFileFormat::new(version, alignment),
+            used_size,
         });
         for listener in &self.listeners {
             listener.post_new_log_file(FileId {
@@ -437,10 +441,12 @@ impl<F: FileSystem> SinglePipe<F> {
             // TODO: test case.
             return Ok(());
         }
-        if let Err(e) = files.fds[(file_seq - files.first_seq) as usize]
-            .handle
-            .sync()
-        {
+        let file = &files.fds[(file_seq - files.first_seq) as usize];
+        if block.offset as usize + block.len <= file.used_size {
+            if let Err(e) = file.handle.sync_range(block.offset as usize, block.len) {
+                panic!("error when sync block {:?}: {}", block, e);
+            }
+        } else if let Err(e) = file.handle.sync() {
             panic!("error when sync block {:?}: {}", block, e);
         }
         Ok(())
@@ -715,6 +721,7 @@ mod tests {
                         .unwrap(),
                 ),
                 format: LogFileFormat::new(version, 0 /* alignment */),
+                used_size: 0,
             }
         }
         let dir = Builder::new()

@@ -408,6 +408,7 @@ impl<F: FileSystem> DualPipesBuilder<F> {
             .map(|f| FileWithFormat {
                 handle: f.handle.clone(),
                 format: f.format.unwrap(),
+                used_size: f.handle.file_size().unwrap(),
             })
             .collect();
         SinglePipe::open(
