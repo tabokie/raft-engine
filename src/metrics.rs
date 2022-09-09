@@ -170,25 +170,29 @@ make_static_metric! {
 }
 
 lazy_static! {
-    // Write path.
+    // # Write path
+    // Duration of `Engine::write()`.
     pub static ref ENGINE_WRITE_DURATION_HISTOGRAM: Histogram = register_histogram!(
         "raft_engine_write_duration_seconds",
         "Bucketed histogram of Raft Engine write duration",
         exponential_buckets(0.00005, 1.8, 26).unwrap()
     )
     .unwrap();
+    // Duration from entering `Engine::write()` to entering `PipeLog::append()`.
     pub static ref ENGINE_WRITE_PREPROCESS_DURATION_HISTOGRAM: Histogram = register_histogram!(
         "raft_engine_write_preprocess_duration_seconds",
         "Bucketed histogram of Raft Engine write preprocess duration",
         exponential_buckets(0.00005, 1.8, 26).unwrap()
     )
     .unwrap();
+    // The duration spent on `PipeLog` during write. Multiple write requests may only get one sample.
     pub static ref ENGINE_WRITE_LEADER_DURATION_HISTOGRAM: Histogram = register_histogram!(
         "raft_engine_write_leader_duration_seconds",
         "Bucketed histogram of Raft Engine write leader duration",
         exponential_buckets(0.00005, 1.8, 26).unwrap()
     )
     .unwrap();
+    // The duration spent on updating `MemTable` during write.
     pub static ref ENGINE_WRITE_APPLY_DURATION_HISTOGRAM: Histogram = register_histogram!(
         "raft_engine_write_apply_duration_seconds",
         "Bucketed histogram of Raft Engine write apply duration",

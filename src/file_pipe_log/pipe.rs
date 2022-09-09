@@ -11,7 +11,7 @@ use log::error;
 use parking_lot::{Mutex, MutexGuard, RwLock};
 
 use crate::config::Config;
-use crate::env::FileSystem;
+use crate::env::{FileSystem, Handle};
 use crate::event_listener::EventListener;
 use crate::metrics::*;
 use crate::pipe_log::{
@@ -297,7 +297,7 @@ impl<F: FileSystem> SinglePipe<F> {
         } else {
             self.file_system.create(&path)?
         });
-        let mut new_file = ActiveFile {
+        let new_file = ActiveFile {
             seq,
             // The file might generated from a recycled stale-file, always reset the file
             // header of it.
@@ -311,7 +311,7 @@ impl<F: FileSystem> SinglePipe<F> {
         };
         // File header must be persisted. This way we can recover gracefully if power
         // loss before a new entry is written.
-        new_file.writer.sync()?;
+        fd.sync()?;
         self.sync_dir()?;
         let version = new_file.format.version;
         let alignment = new_file.format.alignment;
@@ -420,10 +420,29 @@ impl<F: FileSystem> SinglePipe<F> {
         {
             let _t = StopWatch::new(perf_context!(log_sync_duration));
             if let Err(e) = writer.sync() {
-                panic!("error when sync [{:?}:{}]: {}", self.queue, seq, e,);
+                panic!("error when sync [{:?}:{}]: {}", self.queue, seq, e);
             }
         }
 
+        Ok(())
+    }
+
+    fn sync_block(&self, block: FileBlockHandle) -> Result<()> {
+        let _t = StopWatch::new(perf_context!(log_sync_duration));
+        let file_seq = block.id.seq;
+        let files = self.files.read();
+        if !(files.first_seq_in_use..files.first_seq_in_use + files.fds.len() as u64)
+            .contains(&file_seq)
+        {
+            // TODO: test case.
+            return Ok(());
+        }
+        if let Err(e) = files.fds[(file_seq - files.first_seq) as usize]
+            .handle
+            .sync()
+        {
+            panic!("error when sync block {:?}: {}", block, e);
+        }
         Ok(())
     }
 
@@ -527,6 +546,11 @@ impl<F: FileSystem> PipeLog for DualPipes<F> {
     #[inline]
     fn sync(&self, queue: LogQueue) -> Result<()> {
         self.pipes[queue as usize].sync()
+    }
+
+    #[inline]
+    fn sync_block(&self, block: FileBlockHandle) -> Result<()> {
+        self.pipes[block.id.queue as usize].sync_block(block)
     }
 
     #[inline]

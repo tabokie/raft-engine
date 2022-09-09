@@ -55,6 +55,7 @@ pub struct Config {
     ///
     /// Default: "4MB"
     pub bytes_per_sync: Option<ReadableSize>,
+    pub parallel_sync: bool,
 
     /// Version of the log file.
     ///
@@ -103,6 +104,7 @@ impl Default for Config {
             recovery_threads: 4,
             batch_compression_threshold: ReadableSize::kb(8),
             bytes_per_sync: None,
+            parallel_sync: true,
             format_version: Version::V2,
             target_file_size: ReadableSize::mb(128),
             purge_threshold: ReadableSize::gb(10),

@@ -211,6 +211,7 @@ fn test_concurrent_write_error() {
     let cfg = Config {
         dir: dir.path().to_str().unwrap().to_owned(),
         target_file_size: ReadableSize::kb(1024),
+        parallel_sync: false,
         ..Default::default()
     };
     let entry = vec![b'x'; 1024];

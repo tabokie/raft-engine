@@ -142,7 +142,18 @@ where
         let start = Instant::now();
         let len = log_batch.finish_populate(self.cfg.batch_compression_threshold.0 as usize)?;
         debug_assert!(len > 0);
-        let block_handle = {
+        let block_handle = if self.cfg.parallel_sync {
+            let now = Instant::now();
+            ENGINE_WRITE_PREPROCESS_DURATION_HISTOGRAM
+                .observe(now.saturating_duration_since(start).as_secs_f64());
+            let _t = StopWatch::new_with(&*ENGINE_WRITE_LEADER_DURATION_HISTOGRAM, now);
+            let res = self.pipe_log.append(LogQueue::Append, log_batch)?;
+            perf_context!(log_write_duration).observe_since(now);
+            if sync {
+                self.pipe_log.sync_block(res).expect("pipe::sync()");
+            }
+            res
+        } else {
             let mut writer = Writer::new(log_batch, sync);
             // Snapshot and clear the current perf context temporarily, so the write group
             // leader will collect the perf context diff later.

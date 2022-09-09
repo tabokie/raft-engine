@@ -222,6 +222,7 @@ fn test_concurrent_write_empty_log_batch() {
         .unwrap();
     let cfg = Config {
         dir: dir.path().to_str().unwrap().to_owned(),
+        parallel_sync: false,
         ..Default::default()
     };
     let engine = Arc::new(Engine::open(cfg.clone()).unwrap());
@@ -538,6 +539,7 @@ fn test_concurrent_write_perf_context() {
         .unwrap();
     let cfg = Config {
         dir: dir.path().to_str().unwrap().to_owned(),
+        parallel_sync: false,
         ..Default::default()
     };
 

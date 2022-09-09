@@ -79,6 +79,15 @@ impl FileBlockHandle {
             len: 0,
         }
     }
+
+    #[inline]
+    pub fn whole_file(id: FileId) -> Self {
+        Self {
+            id,
+            offset: 0,
+            len: usize::MAX,
+        }
+    }
 }
 
 /// Version of log file format.
@@ -185,6 +194,8 @@ pub trait PipeLog: Sized {
     /// This operation might incurs a great latency overhead. It's advised to
     /// call it once every batch of writes.
     fn sync(&self, queue: LogQueue) -> Result<()>;
+
+    fn sync_block(&self, block: FileBlockHandle) -> Result<()>;
 
     /// Returns the smallest and largest file sequence number, still in use,
     /// of the specified log queue.
