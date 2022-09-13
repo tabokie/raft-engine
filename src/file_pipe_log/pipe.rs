@@ -122,6 +122,7 @@ pub(super) struct SinglePipe<F: FileSystem> {
     dir: String,
     file_format: LogFileFormat,
     target_file_size: usize,
+    use_sync_range: bool,
     file_system: Arc<F>,
     listeners: Vec<Arc<dyn EventListener>>,
 
@@ -226,6 +227,7 @@ impl<F: FileSystem> SinglePipe<F> {
             dir: cfg.dir.clone(),
             file_format: LogFileFormat::new(cfg.format_version, alignment),
             target_file_size: cfg.target_file_size.0 as usize,
+            use_sync_range: cfg.use_sync_range,
             file_system,
             listeners,
 
@@ -442,7 +444,7 @@ impl<F: FileSystem> SinglePipe<F> {
             return Ok(());
         }
         let file = &files.fds[(file_seq - files.first_seq) as usize];
-        if block.offset as usize + block.len <= file.used_size {
+        if self.use_sync_range && block.offset as usize + block.len <= file.used_size {
             if let Err(e) = file.handle.sync_range(block.offset as usize, block.len) {
                 panic!("error when sync block {:?}: {}", block, e);
             }
