@@ -383,7 +383,8 @@ where
 
     #[cfg(any(feature = "internals", test))]
     pub fn purge_manager(&self) -> MutexGuard<PurgeManager<P>> {
-        self.purge_manager.try_lock().unwrap()
+        // Ignore poison error.
+        self.purge_manager.lock().unwrap_or_else(|e| e.into_inner())
     }
 }
 
@@ -672,13 +673,13 @@ mod tests {
                 &mut entries,
             )
             .unwrap();
-            assert_eq!(entries.first().unwrap().index, start);
-            assert_eq!(entries.last().unwrap().index + 1, end);
             assert_eq!(entries.len(), (end - start) as usize);
+            assert_eq!(entries.first().unwrap().index, start);
             assert_eq!(
                 entries.last().unwrap().index,
                 self.decode_last_index(rid).unwrap()
             );
+            assert_eq!(entries.last().unwrap().index + 1, end);
             for e in entries.iter() {
                 let entry_index = self
                     .memtables

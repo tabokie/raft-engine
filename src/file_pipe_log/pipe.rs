@@ -391,7 +391,7 @@ impl<F: FileSystem> SinglePipe<F> {
         }
         let start_offset = writer.offset();
         if let Err(e) = writer.write(bytes.as_bytes(&ctx), self.target_file_size) {
-            if let Err(te) = writer.truncate(None) {
+            if let Err(te) = writer.truncate() {
                 panic!(
                     "error when truncate {} after error: {}, get: {}",
                     seq, e, te

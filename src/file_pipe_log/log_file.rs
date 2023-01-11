@@ -76,17 +76,11 @@ impl<F: FileSystem> LogFileWriter<F> {
 
     pub fn close(&mut self) -> Result<()> {
         // Necessary to truncate extra zeros from fallocate().
-        self.truncate(None)?;
+        self.truncate()?;
         self.sync()
     }
 
-    pub fn truncate(&mut self, offset: Option<usize>) -> Result<()> {
-        if let Some(offset) = offset {
-            if offset < self.written {
-                self.writer.seek(SeekFrom::Start(offset as u64))?;
-                self.written = offset;
-            }
-        }
+    pub fn truncate(&mut self) -> Result<()> {
         if self.written < self.capacity {
             fail_point!("file_pipe_log::log_file_writer::skip_truncate", |_| {
                 Ok(())
