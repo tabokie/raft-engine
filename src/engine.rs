@@ -595,7 +595,7 @@ where
 mod tests {
     use super::*;
     use crate::env::ObfuscatedFileSystem;
-    use crate::file_pipe_log::{parse_recycled_file_name, FileNameExt};
+    use crate::file_pipe_log::FileNameExt;
     use crate::log_batch::AtomicGroupBuilder;
     use crate::pipe_log::Version;
     use crate::test_util::{generate_entries, PanicGuard};
@@ -1551,8 +1551,6 @@ mod tests {
                 dir: dir.path().to_str().unwrap().to_owned(),
                 target_file_size: ReadableSize(1),
                 purge_threshold: ReadableSize(1),
-                format_version: Version::V1,
-                enable_log_recycle: false,
                 ..Default::default()
             };
             // config with v2
@@ -1561,7 +1559,6 @@ mod tests {
                 target_file_size: ReadableSize(1),
                 purge_threshold: ReadableSize(1),
                 format_version: Version::V2,
-                enable_log_recycle: false,
                 ..Default::default()
             };
             test_engine_ops(&cfg_v1, &cfg_v2);
@@ -1577,8 +1574,6 @@ mod tests {
                 dir: dir.path().to_str().unwrap().to_owned(),
                 target_file_size: ReadableSize(1),
                 purge_threshold: ReadableSize(1),
-                format_version: Version::V1,
-                enable_log_recycle: false,
                 ..Default::default()
             };
             // config with v2
@@ -1588,7 +1583,6 @@ mod tests {
                 purge_threshold: ReadableSize(1),
                 format_version: Version::V2,
                 enable_log_recycle: true,
-                prefill_for_recycle: true,
                 ..Default::default()
             };
             test_engine_ops(&cfg_v1, &cfg_v2);
@@ -1954,7 +1948,6 @@ mod tests {
     pub struct DeleteMonitoredFileSystem {
         inner: ObfuscatedFileSystem,
         append_metadata: Mutex<BTreeSet<u64>>,
-        recycled_metadata: Mutex<BTreeSet<u64>>,
     }
 
     impl DeleteMonitoredFileSystem {
@@ -1962,30 +1955,19 @@ mod tests {
             Self {
                 inner: ObfuscatedFileSystem::default(),
                 append_metadata: Mutex::new(BTreeSet::new()),
-                recycled_metadata: Mutex::new(BTreeSet::new()),
             }
         }
 
         fn update_metadata(&self, path: &Path, delete: bool) -> bool {
-            let path = path.file_name().unwrap().to_str().unwrap();
-            let parse_append = FileId::parse_file_name(path);
-            let parse_recycled = parse_recycled_file_name(path);
-            match (parse_append, parse_recycled) {
-                (Some(id), None) if id.queue == LogQueue::Append => {
-                    if delete {
-                        self.append_metadata.lock().unwrap().remove(&id.seq)
-                    } else {
-                        self.append_metadata.lock().unwrap().insert(id.seq)
-                    }
+            let id = FileId::parse_file_name(path.file_name().unwrap().to_str().unwrap()).unwrap();
+            if id.queue == LogQueue::Append {
+                if delete {
+                    self.append_metadata.lock().unwrap().remove(&id.seq)
+                } else {
+                    self.append_metadata.lock().unwrap().insert(id.seq)
                 }
-                (None, Some(seq)) => {
-                    if delete {
-                        self.recycled_metadata.lock().unwrap().remove(&seq)
-                    } else {
-                        self.recycled_metadata.lock().unwrap().insert(seq)
-                    }
-                }
-                _ => false,
+            } else {
+                false
             }
         }
     }
@@ -2037,15 +2019,12 @@ mod tests {
             if self.inner.exists_metadata(&path) {
                 return true;
             }
-            let path = path.as_ref().file_name().unwrap().to_str().unwrap();
-            let parse_append = FileId::parse_file_name(path);
-            let parse_recycled = parse_recycled_file_name(path);
-            match (parse_append, parse_recycled) {
-                (Some(id), None) if id.queue == LogQueue::Append => {
-                    self.append_metadata.lock().unwrap().contains(&id.seq)
-                }
-                (None, Some(seq)) => self.recycled_metadata.lock().unwrap().contains(&seq),
-                _ => false,
+            let id = FileId::parse_file_name(path.as_ref().file_name().unwrap().to_str().unwrap())
+                .unwrap();
+            if id.queue == LogQueue::Append {
+                self.append_metadata.lock().unwrap().contains(&id.seq)
+            } else {
+                false
             }
         }
 
@@ -2101,7 +2080,7 @@ mod tests {
             &start
         );
 
-        // Simulate recycled metadata.
+        // Simulate stale metadata.
         for i in start / 2..start {
             fs.append_metadata.lock().unwrap().insert(i);
         }
@@ -2126,12 +2105,10 @@ mod tests {
             purge_threshold: ReadableSize(100),
             format_version: Version::V2,
             enable_log_recycle: true,
-            prefill_for_recycle: true,
             ..Default::default()
         };
         let fs = Arc::new(DeleteMonitoredFileSystem::new());
         let engine = RaftLogEngine::open_with_file_system(cfg, fs.clone()).unwrap();
-        let recycled_start = *fs.recycled_metadata.lock().unwrap().iter().next().unwrap();
         for rid in 1..=10 {
             engine.append(rid, 1, 11, Some(&entry_data));
         }
@@ -2146,31 +2123,23 @@ mod tests {
             .must_rewrite_append_queue(Some(end - 1), None);
         assert!(start < engine.file_span(LogQueue::Append).0);
         assert_eq!(engine.file_count(Some(LogQueue::Append)), 1);
-        // Recycled files have been reused.
+        // no file have been physically deleted.
         assert_eq!(
             fs.append_metadata.lock().unwrap().iter().next().unwrap(),
-            &(start + 20)
+            &start
         );
-        let recycled_start_1 = *fs.recycled_metadata.lock().unwrap().iter().next().unwrap();
-        assert!(recycled_start < recycled_start_1);
-        // Reuse these files.
+        // reusing these files.
         for rid in 1..=5 {
             engine.append(rid, 1, 11, Some(&entry_data));
         }
         let start_1 = *fs.append_metadata.lock().unwrap().iter().next().unwrap();
-        assert!(start <= start_1);
-        let recycled_start_2 = *fs.recycled_metadata.lock().unwrap().iter().next().unwrap();
-        assert!(recycled_start_1 < recycled_start_2);
+        assert!(start < start_1);
 
-        // Reopen the engine and validate the recycled files are reserved
-        let file_count = fs.inner.file_count();
+        // reopen the engine and validate the stale files are removed
         let engine = engine.reopen();
-        assert_eq!(file_count, fs.inner.file_count());
-        assert!(file_count > engine.file_count(None));
+        assert_eq!(fs.inner.file_count(), engine.file_count(None));
         let start_2 = *fs.append_metadata.lock().unwrap().iter().next().unwrap();
-        assert_eq!(start_1, start_2);
-        let recycled_start_3 = *fs.recycled_metadata.lock().unwrap().iter().next().unwrap();
-        assert_eq!(recycled_start_2, recycled_start_3);
+        assert!(start_1 < start_2);
     }
 
     #[test]
@@ -2279,97 +2248,6 @@ mod tests {
             assert_eq!(engine.file_count(Some(LogQueue::Append)), 1);
             assert!(engine.file_span(LogQueue::Append).0 > start);
         }
-    }
-
-    #[test]
-    fn test_start_engine_with_resize_recycle_capacity() {
-        let dir = tempfile::Builder::new()
-            .prefix("test_start_engine_with_resize_recycle_capacity")
-            .tempdir()
-            .unwrap();
-        let path = dir.path().to_str().unwrap();
-        let file_system = Arc::new(DeleteMonitoredFileSystem::new());
-        let entry_data = vec![b'x'; 512];
-
-        // Case 1: start an engine with no-recycle.
-        let cfg = Config {
-            dir: path.to_owned(),
-            enable_log_recycle: false,
-            ..Default::default()
-        };
-        let engine = RaftLogEngine::open_with_file_system(cfg, file_system.clone()).unwrap();
-        let (start, _) = engine.file_span(LogQueue::Append);
-        // Only one valid file left, the last one => active_file.
-        assert_eq!(engine.file_count(Some(LogQueue::Append)), 1);
-        assert_eq!(file_system.inner.file_count(), engine.file_count(None));
-        // Append data.
-        for rid in 1..=5 {
-            engine.append(rid, 1, 10, Some(&entry_data));
-        }
-        assert_eq!(engine.file_span(LogQueue::Append).0, start);
-        assert_eq!(file_system.inner.file_count(), engine.file_count(None));
-        drop(engine);
-
-        // Case 2: restart the engine with a common size of recycling capacity.
-        let cfg = Config {
-            dir: path.to_owned(),
-            target_file_size: ReadableSize(1),
-            purge_threshold: ReadableSize(80), // common size of capacity
-            enable_log_recycle: true,
-            prefill_for_recycle: true,
-            ..Default::default()
-        };
-        let engine =
-            RaftLogEngine::open_with_file_system(cfg.clone(), file_system.clone()).unwrap();
-        let (start, end) = engine.file_span(LogQueue::Append);
-        // Only one valid file left, the last one => active_file.
-        assert_eq!(start, end);
-        let recycled_count = file_system.inner.file_count() - engine.file_count(None);
-        assert!(recycled_count > 0);
-        // Append data. Several recycled files have been reused.
-        for rid in 1..=5 {
-            engine.append(rid, 10, 20, Some(&entry_data));
-        }
-        assert_eq!(engine.file_span(LogQueue::Append).0, start);
-        assert!(recycled_count > file_system.inner.file_count() - engine.file_count(None));
-        let (start, end) = engine.file_span(LogQueue::Append);
-        let recycled_count = file_system.inner.file_count() - engine.file_count(None);
-        drop(engine);
-
-        // Case 3: restart the engine with a smaller capacity. Redundant recycled files
-        // will be cleared.
-        let cfg_v2 = Config {
-            target_file_size: ReadableSize(1),
-            purge_threshold: ReadableSize(50),
-            ..cfg
-        };
-        let engine =
-            RaftLogEngine::open_with_file_system(cfg_v2.clone(), file_system.clone()).unwrap();
-        assert_eq!(engine.file_span(LogQueue::Append), (start, end));
-        assert!(recycled_count > file_system.inner.file_count() - engine.file_count(None));
-        // Recycled files have filled the LogQueue::Append, purge_expired_files won't
-        // truely remove files from it.
-        engine.purge_expired_files().unwrap();
-        assert_eq!(engine.file_span(LogQueue::Append), (start, end));
-        for rid in 1..=10 {
-            engine.append(rid, 20, 31, Some(&entry_data));
-        }
-        assert!(engine.file_span(LogQueue::Append).1 > end);
-        let engine = engine.reopen();
-        assert!(recycled_count > file_system.inner.file_count() - engine.file_count(None));
-        drop(engine);
-
-        // Case 4: restart the engine without log recycling. Recycled logs should be
-        // cleared.
-        let cfg_v3 = Config {
-            target_file_size: ReadableSize::kb(2),
-            purge_threshold: ReadableSize::kb(100),
-            enable_log_recycle: false,
-            prefill_for_recycle: false,
-            ..cfg_v2
-        };
-        let engine = RaftLogEngine::open_with_file_system(cfg_v3, file_system.clone()).unwrap();
-        assert_eq!(file_system.inner.file_count(), engine.file_count(None));
     }
 
     #[test]

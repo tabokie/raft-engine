@@ -38,7 +38,7 @@ clean:
 
 ## Format code in-place using rustfmt.
 format:
-	cargo ${TOOLCHAIN_ARGS} fmt --all
+	cargo fmt --all
 
 ## Run clippy.
 clippy:
