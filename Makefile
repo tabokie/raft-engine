@@ -53,10 +53,14 @@ endif
 test:
 ifdef WITH_NIGHTLY_FEATURES
 	cargo ${TOOLCHAIN_ARGS} test --all --features all_except_failpoints ${EXTRA_CARGO_ARGS} -- --nocapture
-	cargo ${TOOLCHAIN_ARGS} test --test failpoints --all-features ${EXTRA_CARGO_ARGS} -- --test-threads 1 --nocapture
+	cargo ${TOOLCHAIN_ARGS} test --all --features all_unix_except_failpoints ${EXTRA_CARGO_ARGS} -- --nocapture
+	cargo ${TOOLCHAIN_ARGS} test --test failpoints --features all_unix ${EXTRA_CARGO_ARGS} -- --test-threads 1 --nocapture
+	cargo ${TOOLCHAIN_ARGS} test --test failpoints --features all_std_fs ${EXTRA_CARGO_ARGS} -- --test-threads 1 --nocapture
 else
 	cargo ${TOOLCHAIN_ARGS} test --all --features all_stable_except_failpoints ${EXTRA_CARGO_ARGS} -- --nocapture
+	cargo ${TOOLCHAIN_ARGS} test --all --features all_unix_stable_except_failpoints ${EXTRA_CARGO_ARGS} -- --nocapture
 	cargo ${TOOLCHAIN_ARGS} test --test failpoints --features all_stable ${EXTRA_CARGO_ARGS} -- --test-threads 1 --nocapture
+	cargo ${TOOLCHAIN_ARGS} test --test failpoints --features all_unix_stable ${EXTRA_CARGO_ARGS} -- --test-threads 1 --nocapture
 endif
 
 ## Build raft-engine-ctl.

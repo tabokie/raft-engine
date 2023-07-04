@@ -86,11 +86,20 @@ swap = [
   "nightly",
   "memmap2",
 ]
+std_fs = []
 
 # Shortcuts
-all_except_failpoints = ["internals", "scripting", "nightly", "swap"]
-all_stable = ["internals", "scripting", "failpoints"]
-all_stable_except_failpoints = ["internals", "scripting"]
+all_unix = ["internals", "scripting", "failpoints", "nightly", "swap"]
+all_std_fs = ["internals", "scripting", "failpoints", "nightly", "std_fs"]
+
+all_except_failpoints = ["internals", "scripting", "nightly", "swap", "std_fs"]
+all_unix_except_failpoints = ["internals", "scripting", "nightly", "swap"]
+
+all_stable = ["internals", "scripting", "failpoints", "std_fs"]
+all_unix_stable = ["internals", "scripting", "failpoints"]
+
+all_stable_except_failpoints = ["internals", "scripting", "std_fs"]
+all_unix_stable_except_failpoints = ["internals", "scripting"]
 
 [patch.crates-io]
 raft-proto = { git = "https://github.com/tikv/raft-rs", branch = "master" }
