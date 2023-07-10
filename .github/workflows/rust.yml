@@ -35,11 +35,6 @@ jobs:
           git diff --exit-code
       - name: Clippy
         run: make clippy
-      - name: Setup gRPC env in Windows
-        if: ${{ matrix.os == 'windows-latest' }}
-        uses: eWaterCycle/setup-grpc@v5
-        with:
-          grpc-version: 1.44.0
       - name: Run tests
         run: make test
         env:
