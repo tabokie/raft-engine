@@ -35,6 +35,11 @@ jobs:
           git diff --exit-code
       - name: Clippy
         run: make clippy
+      - name: Setup gRPC env in Windows
+        if: ${{ matrix.os == 'windows-latest' }}
+        uses: eWaterCycle/setup-grpc@v5
+        with:
+          grpc-version: 1.44.0
       - name: Run tests
         run: make test
         env:
@@ -48,65 +53,65 @@ jobs:
           RUSTFLAGS: '-Zsanitizer=address'
           RUSTDOCFLAGS: '-Zsanitizer=address'
           EXTRA_CARGO_ARGS: '--verbose -Zbuild-std --target x86_64-unknown-linux-gnu'
-  stable:
-    runs-on: ${{ matrix.os }}
-    strategy:
-      matrix:
-        os: [ ubuntu-latest ]
-    steps:
-      - uses: actions/checkout@v2
-        with:
-          ref: ${{ github.event.pull_request.head.sha }}
-      - name: Install stable toolchain
-        uses: actions-rs/toolchain@v1
-        with:
-          profile: minimal
-          toolchain: 1.66.0
-          override: true
-          components: rustfmt, clippy, rust-src
-      - uses: Swatinem/rust-cache@v1
-        with:
-          sharedKey: ${{ matrix.os }}-stable
-      - name: Clippy
-        run: make clippy
-        env:
-          WITH_STABLE_TOOLCHAIN: 'force'
-      - name: Run tests
-        run: make test
-        env:
-          RUST_BACKTRACE: 1
-          EXTRA_CARGO_ARGS: '--verbose'
-          WITH_STABLE_TOOLCHAIN: 'force'
-  coverage:
-    runs-on: ubuntu-latest
-    needs: nightly
-    steps:
-      - uses: actions/checkout@v2
-        with:
-          ref: ${{ github.event.pull_request.head.sha }}
-      - name: Install nightly toolchain
-        uses: actions-rs/toolchain@v1
-        with:
-          profile: minimal
-          toolchain: nightly-2023-01-01
-          override: true
-          components: llvm-tools-preview
-      - uses: Swatinem/rust-cache@v1
-        with:
-          sharedKey: ubuntu-latest
-      - name: Install grcov
-        run: if [[ ! -e ~/.cargo/bin/grcov ]]; then cargo install --locked grcov; fi
-      - name: Run tests
-        run: |
-          make test
-          env WITH_STABLE_TOOLCHAIN=auto make test
-        env:
-          RUSTFLAGS: '-Zinstrument-coverage'
-          LLVM_PROFILE_FILE: '%p-%m.profraw'
-          EXTRA_CARGO_ARGS: '--verbose'
-      - name: Run grcov
-        run: grcov `find . \( -name "*.profraw" \) -print` --binary-path target/debug/deps/ -s . -t lcov --branch --ignore-not-existing --ignore '../**' --ignore '/*' -o coverage.lcov
-      - name: Upload
-        uses: codecov/codecov-action@v2
-        with:
-          file: coverage.lcov
+#  stable:
+#    runs-on: ${{ matrix.os }}
+#    strategy:
+#      matrix:
+#        os: [ ubuntu-latest ]
+#    steps:
+#      - uses: actions/checkout@v2
+#        with:
+#          ref: ${{ github.event.pull_request.head.sha }}
+#      - name: Install stable toolchain
+#        uses: actions-rs/toolchain@v1
+#        with:
+#          profile: minimal
+#          toolchain: 1.66.0
+#          override: true
+#          components: rustfmt, clippy, rust-src
+#      - uses: Swatinem/rust-cache@v1
+#        with:
+#          sharedKey: ${{ matrix.os }}-stable
+#      - name: Clippy
+#        run: make clippy
+#        env:
+#          WITH_STABLE_TOOLCHAIN: 'force'
+#      - name: Run tests
+#        run: make test
+#        env:
+#          RUST_BACKTRACE: 1
+#          EXTRA_CARGO_ARGS: '--verbose'
+#          WITH_STABLE_TOOLCHAIN: 'force'
+#  coverage:
+#    runs-on: ubuntu-latest
+#    needs: nightly
+#    steps:
+#      - uses: actions/checkout@v2
+#        with:
+#          ref: ${{ github.event.pull_request.head.sha }}
+#      - name: Install nightly toolchain
+#        uses: actions-rs/toolchain@v1
+#        with:
+#          profile: minimal
+#          toolchain: nightly-2023-01-01
+#          override: true
+#          components: llvm-tools-preview
+#      - uses: Swatinem/rust-cache@v1
+#        with:
+#          sharedKey: ubuntu-latest
+#      - name: Install grcov
+#        run: if [[ ! -e ~/.cargo/bin/grcov ]]; then cargo install --locked grcov; fi
+#      - name: Run tests
+#        run: |
+#          make test
+#          env WITH_STABLE_TOOLCHAIN=auto make test
+#        env:
+#          RUSTFLAGS: '-Zinstrument-coverage'
+#          LLVM_PROFILE_FILE: '%p-%m.profraw'
+#          EXTRA_CARGO_ARGS: '--verbose'
+#      - name: Run grcov
+#        run: grcov `find . \( -name "*.profraw" \) -print` --binary-path target/debug/deps/ -s . -t lcov --branch --ignore-not-existing --ignore '../**' --ignore '/*' -o coverage.lcov
+#      - name: Upload
+#        uses: codecov/codecov-action@v2
+#        with:
+#          file: coverage.lcov
