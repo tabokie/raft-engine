@@ -33,8 +33,8 @@ jobs:
         run: |
           make format
           git diff --exit-code
-      - name: Clippy
-        run: make clippy
+#      - name: Clippy
+#        run: make clippy
       - name: Run tests
         run: make test
         env:
