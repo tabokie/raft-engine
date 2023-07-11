@@ -102,7 +102,7 @@ all_stable_except_failpoints = ["internals", "scripting", "std_fs"]
 all_unix_stable_except_failpoints = ["internals", "scripting"]
 
 [patch.crates-io]
-raft-proto = { git = "https://github.com/tikv/raft-rs", branch = "master" }
+raft-proto = { git = "https://github.com/tikv/raft-rs", branch = "master", default-features = false, features = ["prost-codec"] }
 protobuf = { git = "https://github.com/pingcap/rust-protobuf", branch = "v2.8" }
 protobuf-codegen = { git = "https://github.com/pingcap/rust-protobuf", branch = "v2.8" }
 
